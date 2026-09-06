@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned upstream ENet used by the enet-helper interop oracle
+  # (lsalzman/enet; must match the revision the README pins).
+  ENET_REV: 5a9c537
+
+jobs:
+  test:
+    name: Build & test (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout lenet-rs
+        uses: actions/checkout@v4
+
+      # Sibling checkouts: lenet-sys links liblenet.a from ../lenet/csrc/build
+      # and enet-helper builds the ENet oracle from ../enet.
+      - name: Checkout Lenet (C distribution source)
+        uses: actions/checkout@v4
+        with:
+          # The Lenet repo (Lean sources + csrc Makefile) is expected as a
+          # sibling of this repository, owned by the same account. Adjust
+          # `repository:` if it lives elsewhere.
+          repository: ${{ github.repository_owner }}/lenet
+          path: ../lenet
+
+      - name: Checkout ENet (interop oracle, pinned revision)
+        run: |
+          git clone https://github.com/lsalzman/enet ../enet
+          git -C ../enet checkout "$ENET_REV"
+
+      - name: Install elan (Lean toolchain manager)
+        run: |
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Compute Lean toolchain cache key
+        id: lean
+        run: echo "key=lean-${{ runner.os }}-$(cat ../lenet/lean-toolchain)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Lean toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan/toolchains
+          key: ${{ steps.lean.outputs.key }}
+
+      - name: Install pinned Lean toolchain
+        run: elan toolchain install "$(cat ../lenet/lean-toolchain)"
+
+      - name: Build liblenet.a (Lean build + C shim, merged archive)
+        run: make -C ../lenet/csrc
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests (sans-I/O + live ENet interop)
+        run: cargo test --workspace
