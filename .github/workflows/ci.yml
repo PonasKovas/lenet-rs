@@ -13,62 +13,29 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Pinned upstream ENet used by the enet-helper interop oracle
-  # (lsalzman/enet; must match the revision the README pins).
-  ENET_REV: 5a9c537
-
 jobs:
   test:
     name: Build & test (linux)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout lenet-rs
-        uses: actions/checkout@v4
-
-      # Sibling checkouts: lenet-sys links liblenet.a from ../lenet/csrc/build
-      # and enet-helper builds the ENet oracle from ../enet.
-      - name: Checkout Lenet (C distribution source)
-        uses: actions/checkout@v4
-        with:
-          # The Lenet repo (Lean sources + csrc Makefile) is expected as a
-          # sibling of this repository, owned by the same account. Adjust
-          # `repository:` if it lives elsewhere.
-          repository: ${{ github.repository_owner }}/lenet
-          path: ../lenet
-
-      - name: Checkout ENet (interop oracle, pinned revision)
-        run: |
-          git clone https://github.com/lsalzman/enet ../enet
-          git -C ../enet checkout "$ENET_REV"
-
-      - name: Install elan (Lean toolchain manager)
-        run: |
-          curl -sSfL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-
-      - name: Compute Lean toolchain cache key
-        id: lean
-        run: echo "key=lean-${{ runner.os }}-$(cat ../lenet/lean-toolchain)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache Lean toolchains
-        uses: actions/cache@v4
-        with:
-          path: ~/.elan/toolchains
-          key: ${{ steps.lean.outputs.key }}
-
-      - name: Install pinned Lean toolchain
-        run: elan toolchain install "$(cat ../lenet/lean-toolchain)"
-
-      - name: Build liblenet.a (Lean build + C shim, merged archive)
-        run: make -C ../lenet/csrc
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # The lenet-sys build script fetches the Lenet sources (pinned
+      # revision, see LENET_REV in lenet-sys/build.rs) and provisions the
+      # pinned Lean toolchain on first use; cache it here.
+      - name: Cache Lean toolchains
+        uses: actions/cache@v6
+        with:
+          path: ~/.elan/toolchains
+          key: lean-${{ runner.os }}-${{ hashFiles('lenet-sys/build.rs') }}
+
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@v2.9.2
 
       - name: rustfmt
         run: cargo fmt --all --check
@@ -76,5 +43,8 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Builds everything from scratch on a fresh runner: lenet-sys fetches
+      # + builds Lenet (Lean) and enet-helper fetches + builds ENet; the
+      # interop tests then run against the live C ENet oracle.
       - name: Tests (sans-I/O + live ENet interop)
         run: cargo test --workspace

@@ -22,10 +22,10 @@ static C archive.
 
 | crate         | purpose |
 |---------------|---------|
-| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` links `liblenet.a` from `LENET_LIB_DIR` (default: the sibling `lenet` checkout's `csrc/build`). |
+| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` fetches Lenet at a pinned revision, provisions the Lean toolchain (elan) if needed, and builds `liblenet.a` automatically — the crate behaves like any normal sys crate. |
 | `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out (borrowed views, zero-copy). One host, one thread. |
 | `lenet-tokio` | The async driver: stall-free pump loop, `Connecting`/`Connection`/`Incoming` handles, per-connection event queues, real send backpressure. |
-| `enet-helper` | Test oracle only: a real C ENet endpoint (pinned upstream `lsalzman/enet @ 5a9c537`). |
+| `enet-helper` | Test oracle only: a real C ENet endpoint; fetches + builds upstream `lsalzman/enet` (pinned) automatically. |
 
 ## Usage
 
@@ -138,15 +138,26 @@ libraries (the Lean runtime is not `-fPIC`).
 
 ## Building & testing
 
-Prerequisites: Rust (stable), the sibling `lenet` repo with its C
-distribution built, and an ENet checkout (pinned revision) for the interop
-test:
+Prerequisites: Rust (stable), `git`, `curl`, and a C toolchain (`cc`/`make`).
+That's it — the build scripts fetch and build everything else on first use:
 
 ```sh
-# 1. Build the Lenet C archive (done once, or after changes upstream):
-make -C ../lenet/csrc
+cargo test --workspace
+```
 
-# 2. Build + test everything, including the live ENet interop:
+On the first build, `lenet-sys` clones the [Lenet](https://github.com/PonasKovas/lenet)
+repo at a pinned revision (see `LENET_REV` in `lenet-sys/build.rs`), installs
+the Lean toolchain it pins via elan if you don't have one, and compiles
+`liblenet.a`; `enet-helper` clones upstream ENet at a pinned revision and
+builds it with cmake. Subsequent builds are incremental no-ops.
+
+**Developing against a local Lenet/ENet checkout** (e.g. iterating on the
+Lean side): point the build scripts at your checkouts and they build from
+there instead, incrementally:
+
+```sh
+export LENET_DIR=../lenet   # use + rebuild your Lenet checkout
+export ENET_DIR=../enet     # use your ENet checkout for the interop oracle
 cargo test --workspace
 ```
 
@@ -163,9 +174,9 @@ against it over live UDP:
 - `connect_timeout_resolves_timed_out` — attempts to an unresponsive address resolve `TimedOut` per the configured peer timeout
 - `shutdown_closes_everything` — `Endpoint::shutdown` flushes and closes all handles
 
-`ENET_LIB_DIR`/`ENET_HELPER` env vars override the library and oracle
-locations. The helper builds ENet from `../../enet` (cmake); override by
-editing `enet-helper/build.rs` or pointing `ENET_DIR` (see `build.rs`).
+`ENET_HELPER` overrides the oracle binary location (the tests use a
+prebuilt one from `target/debug` when present). `LENET_DIR`/`ENET_DIR`
+override the source checkouts, as shown above.
 
 Threading: the host is not thread-safe (C contract: one host, one thread).
 The pump task is that thread; application handles only exchange messages
