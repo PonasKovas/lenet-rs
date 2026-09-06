@@ -191,14 +191,32 @@ fn ensure_elan() {
     }
 }
 
-/// Installs the exact toolchain Lenet pins. Idempotent: elan no-ops when
-/// the toolchain is already present. `verbose` silences the progress note
-/// on machines that already have a working Lean setup.
+/// True if elan already has the pinned toolchain installed. Matches on the
+/// version part (`v4.33.1`), which appears in the listing regardless of
+/// whether elan shows the full `leanprover/lean4:v4.33.1` name or a bare
+/// version (styles differ across elan versions).
+fn toolchain_installed(pinned: &str) -> bool {
+    let version = pinned.rsplit(':').next().unwrap_or(pinned);
+    Command::new("elan")
+        .args(["toolchain", "list"])
+        .env("PATH", path_with_elan())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(version))
+        .unwrap_or(false)
+}
+
+/// Installs the exact toolchain Lenet pins. Idempotent: newer elan
+/// releases exit non-zero with "already installed", so the list is checked
+/// first and the install skipped when present. A no-op when elan is not
+/// available at all (a self-managed `lake` on PATH is used as-is).
 fn ensure_toolchain(src: &Path, verbose: bool) {
     let pinned = std::fs::read_to_string(src.join("lean-toolchain"))
         .unwrap_or_else(|e| fail(&format!("cannot read lean-toolchain: {e}")))
         .trim()
         .to_string();
+    if !have_tool("elan") || toolchain_installed(&pinned) {
+        return;
+    }
     if verbose {
         println!("cargo:warning=lenet-sys: ensuring Lean toolchain {pinned} (no-op if cached)");
     }

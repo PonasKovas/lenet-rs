@@ -37,6 +37,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bitflags::bitflags;
@@ -257,7 +258,7 @@ impl HostBuilder {
         }
         let host = Host {
             raw,
-            payload_buf: Vec::with_capacity(MAX_RECV_PAYLOAD),
+            payload_buf: vec![MaybeUninit::uninit(); MAX_RECV_PAYLOAD].into_boxed_slice(),
         };
         if self.checksum {
             // SAFETY: `host.raw` is a valid host pointer as of the line above.
@@ -275,9 +276,11 @@ impl HostBuilder {
 pub struct Host {
     raw: *mut ffi::lenet_host,
     /// Reusable receive buffer, pre-sized to the engine's hard maximum
-    /// payload so `poll_event` can never truncate. The allocation is
-    /// virtual; pages are only touched as payloads actually arrive.
-    payload_buf: Vec<u8>,
+    /// payload so `poll_event` can never truncate. Stored as
+    /// `MaybeUninit`: the C layer writes into the raw allocation, and only
+    /// the prefix it reports (`payload_len`) is ever read back as
+    /// initialized.
+    payload_buf: Box<[MaybeUninit<u8>]>,
 }
 
 // The C contract: one host, one thread. A Host may move between threads
@@ -490,6 +493,14 @@ impl Host {
     /// the host's internal buffer and is valid until the next `&mut self`
     /// call on this host. Never truncates: the internal buffer is sized to
     /// the engine's maximum payload.
+    ///
+    /// # Panics
+    ///
+    /// If the C layer violates its contract (reports an event type outside
+    /// `{0, 1}`, or a payload longer than the buffer capacity, which would
+    /// otherwise read out of bounds). Both are engine bugs, not runtime
+    /// conditions, so they panic rather than risk memory safety or silently
+    /// swallow an event.
     pub fn poll_event(&mut self) -> Option<Event<'_>> {
         let mut raw: ffi::lenet_event = ffi::lenet_event {
             type_: 0,
@@ -498,14 +509,10 @@ impl Host {
             data: 0,
         };
         let mut payload_len: usize = 0;
-        // The buffer is never written through the safe Vec API, so its
-        // length stays 0 and its full reserved capacity is usable scratch
-        // space for the C layer.
-        let cap = self.payload_buf.capacity();
+        let cap = self.payload_buf.len();
         let r = unsafe {
             // SAFETY: `self.raw` is valid; `payload_buf` is a valid writable
-            // buffer of `cap` bytes, so `payload_len <= cap` always fits the
-            // slice below.
+            // buffer of `cap` bytes for the call's duration.
             ffi::lenet_host_poll_event(
                 self.raw,
                 &mut raw,
@@ -514,11 +521,19 @@ impl Host {
                 &mut payload_len,
             )
         };
-        debug_assert!(r != -1);
+        // The C layer reports the event's true payload length even when it
+        // had to truncate the copy (`copy = min(len, cap)`), so
+        // `payload_len <= cap` is the load-bearing memory-safety check for
+        // the slice below. A plain assert (not `debug_assert!`): it must
+        // hold in release builds too.
+        assert!(
+            payload_len <= cap,
+            "lenet FFI wrote payload exceeding capacity"
+        );
         if r != 1 {
+            assert!(r == 0, "lenet_host_poll_event failed: {r}");
             return None;
         }
-        debug_assert!(payload_len <= cap);
         let peer = PeerId(raw.peer_id);
         let event = match raw.type_ {
             ffi::LENET_EVENT_CONNECT => Event::Connect {
@@ -532,14 +547,17 @@ impl Host {
             ffi::LENET_EVENT_RECEIVE => Event::Receive {
                 peer,
                 channel_id: raw.channel_id,
-                // SAFETY: the C layer wrote `payload_len` (<= buffer len,
-                // see the assertion above) initialized bytes into
-                // `payload_buf` during the call above.
+                // SAFETY: the C layer wrote `payload_len` (asserted above to
+                // fit the buffer) initialized bytes into `payload_buf`
+                // during the call above; only that prefix is read as `[u8]`.
                 payload: unsafe {
-                    std::slice::from_raw_parts(self.payload_buf.as_ptr(), payload_len)
+                    std::slice::from_raw_parts(self.payload_buf.as_ptr().cast(), payload_len)
                 },
             },
-            _ => return None,
+            _ => panic!(
+                "lenet_host_poll_event reported unknown event type {}",
+                raw.type_
+            ),
         };
         Some(event)
     }
