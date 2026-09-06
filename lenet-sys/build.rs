@@ -1,20 +1,20 @@
 //! Build script: makes `lenet-sys` a normal, self-sufficient sys crate.
 //!
-//! By default it fetches the Lenet sources (a separate repository) at a
-//! pinned revision into this crate's build directory, provisions the Lean
-//! toolchain via elan if needed, and builds `liblenet.a` with the Lenet
-//! repo's own Makefile. All you need is git, curl, cc/make, and a network.
+//! By default it fetches the Lenet sources (a separate repository) into
+//! this crate's build directory — tracking the newest upstream commit —
+//! provisions the Lean toolchain via elan if needed, and builds
+//! `liblenet.a` with the Lenet repo's own Makefile. All you need is git,
+//! curl, cc/make, and a network.
 //!
 //! Local development against a Lenet checkout: set `LENET_DIR` to the repo
-//! root. The build is incremental — editing Lenet sources triggers the
-//! (fast) rebuild of just what changed.
+//! root (no fetching). The build is incremental — editing Lenet sources
+//! triggers the (fast) rebuild of just what changed.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LENET_REPO: &str = "https://github.com/PonasKovas/lenet";
-const LENET_REV: &str = "3197959c253620fe36321d26c27935902c88b347";
 
 const ELAN_INIT: &str = "https://elan.lean-lang.org/elan-init.sh";
 
@@ -40,6 +40,24 @@ fn git(args: &[&str], repo_arg: &Path) {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(repo_arg).args(args);
     run(&format!("git {} <lenet>", args.join(" ")), cmd);
+}
+
+/// Best-effort `git` invocation: true on success, false (with a warning)
+/// on failure. Used where an offline environment should degrade gracefully.
+fn git_tolerant(args: &[&str], repo_arg: &Path) -> bool {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_arg)
+        .args(args)
+        .status();
+    let ok = matches!(status, Ok(s) if s.success());
+    if !ok {
+        println!(
+            "cargo:warning=lenet-sys: `git {} <lenet>` failed (offline?); continuing with the existing Lenet checkout",
+            args.join(" ")
+        );
+    }
+    ok
 }
 
 /// Directories whose existence makes the Lean toolchain available without
@@ -71,8 +89,9 @@ fn path_with_elan() -> std::ffi::OsString {
     env::join_paths(&path).expect("PATH join")
 }
 
-/// Where the Lenet sources live: `LENET_DIR` (developer checkout) or a
-/// pinned clone inside this build's OUT_DIR.
+/// Where the Lenet sources live: `LENET_DIR` (developer checkout) or an
+/// auto-updated clone inside this build's OUT_DIR tracking the newest
+/// upstream commit on the remote's default branch.
 fn resolve_sources(out_dir: &Path) -> PathBuf {
     if let Some(dir) = env::var_os("LENET_DIR") {
         println!("cargo:rerun-if-env-changed=LENET_DIR");
@@ -81,7 +100,7 @@ fn resolve_sources(out_dir: &Path) -> PathBuf {
 
     let dir = out_dir.join("lenet");
     if !dir.join(".git").exists() {
-        println!("cargo:warning=lenet-sys: fetching Lenet sources (pinned {LENET_REV})");
+        println!("cargo:warning=lenet-sys: cloning Lenet (newest upstream commit)");
         let status = Command::new("git")
             .args(["clone", "--quiet", LENET_REPO])
             .arg(&dir)
@@ -91,22 +110,12 @@ fn resolve_sources(out_dir: &Path) -> PathBuf {
             fail(&format!("git clone of {LENET_REPO} failed"));
         }
     }
-    // Move to the pinned revision (fetching first if we don't have it).
-    let at_rev = Command::new("git")
-        .arg("-C")
-        .arg(&dir)
-        .args(["checkout", "--quiet"])
-        .arg(LENET_REV)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !at_rev {
-        git(&["fetch", "origin"], &dir);
-        git(&["checkout", "--quiet", LENET_REV], &dir);
+    // Update to the newest upstream commit. The fetch degrades gracefully
+    // when offline: build from the existing checkout instead.
+    let updated = git_tolerant(&["fetch", "origin"], &dir);
+    if updated {
+        git(&["reset", "--hard", "--quiet", "origin/HEAD"], &dir);
     }
-    // Repair any local damage (interrupted clone, partial writes): the
-    // working tree must exactly match the pinned revision.
-    git(&["reset", "--hard", "--quiet", LENET_REV], &dir);
 
     // Sentinel check: a damaged checkout (e.g. zero-length files after a
     // crash) is wiped and re-cloned rather than trusted.
@@ -130,8 +139,6 @@ fn resolve_sources(out_dir: &Path) -> PathBuf {
         if !status.success() {
             fail(&format!("git clone of {LENET_REPO} failed"));
         }
-        git(&["checkout", "--quiet", LENET_REV], &dir);
-        git(&["reset", "--hard", "--quiet", LENET_REV], &dir);
         if !healthy(&dir) {
             fail("re-cloned Lenet checkout still looks damaged");
         }
@@ -283,4 +290,16 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=m");
+
+    // Make this build script run on every cargo build so the auto-clone
+    // can be refreshed to the newest upstream commit (a cheap no-op when
+    // already current: one `git fetch` + incremental make). Without this,
+    // cargo would only rerun the script when tracked sources change — and
+    // never discover new upstream commits. `LENET_DIR` builds skip the
+    // fetch, but rerunning is harmless there (incremental make).
+    if !env::var_os("LENET_DIR").is_some() {
+        let sentinel = out_dir.join("lenet-always-rerun");
+        println!("cargo:rerun-if-changed={}", sentinel.display());
+        let _ = std::fs::write(&sentinel, "");
+    }
 }

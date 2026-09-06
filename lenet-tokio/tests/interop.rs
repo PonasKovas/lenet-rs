@@ -7,7 +7,8 @@
 //! Requires the `enet-helper` binary (`cargo build --workspace` produces
 //! it); override its location with the `ENET_HELPER` env var.
 
-use std::net::SocketAddr;
+use std::io::Read;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -64,8 +65,8 @@ impl Helper {
         }
     }
 
-    fn addr(&self) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], self.port))
+    fn addr(&self) -> SocketAddrV4 {
+        SocketAddrV4::new(Ipv4Addr::LOCALHOST, self.port)
     }
 }
 
@@ -125,6 +126,18 @@ fn wait_ready(child: &mut Child, out: &mut String, timeout_ms: u64) -> bool {
     false
 }
 
+/// Waits for the helper to exit without blocking the runtime: the pump
+/// must keep servicing the connection (acks, retransmits) for a
+/// `disconnect_later` to eventually flush.
+async fn wait_helper_async(helper: &mut Helper) -> std::process::ExitStatus {
+    loop {
+        if let Some(status) = helper.child.try_wait().expect("try_wait helper") {
+            return status;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind port 0")
@@ -134,7 +147,7 @@ fn free_port() -> u16 {
 }
 
 /// Waits for the connection's handshake to complete.
-async fn handshake(endpoint: &Endpoint, addr: SocketAddr) -> lenet_tokio::Connection {
+async fn handshake(endpoint: &Endpoint, addr: SocketAddrV4) -> lenet_tokio::Connection {
     endpoint
         .connect(addr, 2, 0)
         .expect("connect queued")
@@ -167,7 +180,7 @@ async fn connect_and_reliable_echo() {
     let mut conn = handshake(&endpoint, helper.addr()).await;
 
     // The client knows who it is talking to.
-    assert_eq!(SocketAddr::V4(conn.remote_addr()), helper.addr());
+    assert_eq!(conn.remote_addr(), helper.addr());
 
     conn.send(0, SendFlags::RELIABLE, b"ping-from-rust".to_vec())
         .await
@@ -186,9 +199,30 @@ async fn connect_and_reliable_echo() {
     }
 
     conn.disconnect(42).await.expect("disconnect");
-    // The helper exits 0 after its DISCONNECT.
-    let status = helper.child.wait().expect("wait helper");
+
+    // Async wait: the pump stays live to flush the disconnect datagram
+    // (which may be staged while the kernel send buffer is full). The
+    // helper exits 0 after its DISCONNECT.
+    let status = tokio::time::timeout(Duration::from_secs(10), wait_helper_async(&mut helper))
+        .await
+        .expect("helper exit within timeout");
     assert!(status.success(), "helper exited with {status}");
+
+    // `data=42` proves the helper received OUR graceful disconnect — a
+    // timeout-driven disconnect would print `data=0`.
+    let mut stdout = Vec::new();
+    helper
+        .child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_end(&mut stdout)
+        .expect("read helper stdout");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("DISCONNECT data=42"),
+        "helper must receive the graceful disconnect; stdout:\n{out}"
+    );
 }
 
 #[tokio::test]
@@ -436,7 +470,7 @@ async fn connect_timeout_resolves_timed_out() {
 
     // A loopback port nothing listens on: datagrams are silently dropped,
     // so the attempt can only end in a timeout.
-    let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let dead: SocketAddrV4 = "127.0.0.1:1".parse().unwrap();
     let connecting = endpoint.connect(dead, 1, 0).expect("connect queued");
     let result = tokio::time::timeout(Duration::from_secs(5), connecting)
         .await
@@ -532,10 +566,13 @@ async fn split_halves_full_duplex() {
     }
 
     // Dropping both halves disconnects the peer: the helper's echo server
-    // exits after its DISCONNECT.
+    // exits after its DISCONNECT. Async wait keeps the pump live to flush
+    // the (possibly staged) disconnect datagram.
     drop(tx);
     drop(rx);
-    let status = helper.child.wait().expect("wait helper");
+    let status = tokio::time::timeout(Duration::from_secs(10), wait_helper_async(&mut helper))
+        .await
+        .expect("helper exit within timeout");
     assert!(status.success(), "helper exited with {status}");
 }
 
@@ -583,4 +620,83 @@ async fn accept_queue_keeps_driver_alive_after_endpoint_drop() {
         .await
         .expect("helper client finish");
     assert!(status.success(), "helper client failed: {status}");
+}
+
+/// Dropping a `Connecting` future cancels the attempt: the pump tears the
+/// attempt down (removes the pending handshake and sends the peer a
+/// disconnect) instead of retransmitting until the peer timeout. With a
+/// single peer slot, a second connect can only succeed after the first
+/// attempt was really torn down — here the short peer timeout bounds how
+/// long the cancelled attempt can hold the slot against a dead address.
+#[tokio::test]
+async fn dropping_connecting_frees_the_peer_slot() {
+    let helper = Helper::start();
+    let endpoint = Endpoint::start(
+        LenetConfig::new()
+            .host(lenet::HostBuilder::new().peer_count(1).channel_limit(2))
+            .peer_timeout(2, 200, 400),
+    )
+    .await
+    .expect("endpoint");
+
+    // An attempt to an unresponsive address: stays pending (retransmitting).
+    let dead: SocketAddrV4 = "127.0.0.1:1".parse().unwrap();
+    let connecting = endpoint.connect(dead, 2, 0).expect("connect queued");
+    drop(connecting);
+
+    // Give the pump time to cancel the attempt and the (short) peer
+    // timeout to free the single peer slot, then connect for real.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let mut conn = handshake(&endpoint, helper.addr()).await;
+    conn.send(0, SendFlags::RELIABLE, b"slot-freed".to_vec())
+        .await
+        .expect("send");
+    let ev = tokio::time::timeout(Duration::from_secs(5), conn.recv())
+        .await
+        .expect("recv within timeout")
+        .expect("event");
+    match ev {
+        ConnEvent::Receive { payload, .. } => {
+            assert_eq!(payload, Bytes::from_static(b"slot-freed"));
+        }
+        other => panic!("expected echo, got {other:?}"),
+    }
+}
+
+/// Per-connection FIFO order: a `disconnect_later` queued after a burst of
+/// `send`s must not overtake them — the helper echo server receives every
+/// message before the DISCONNECT (and exits 0 on it).
+#[tokio::test]
+async fn send_before_disconnect_is_delivered() {
+    let mut helper = Helper::start();
+    let endpoint = Endpoint::start(LenetConfig::new()).await.expect("endpoint");
+    let conn = handshake(&endpoint, helper.addr()).await;
+
+    for i in 0..50 {
+        conn.send(0, SendFlags::RELIABLE, format!("msg{i}").into_bytes())
+            .await
+            .expect("send");
+    }
+    conn.disconnect_later(0).await.expect("disconnect");
+
+    // Async wait: the pump keeps running (acking the burst, then flushing
+    // the deferred disconnect) until the helper exits 0.
+    let status = tokio::time::timeout(Duration::from_secs(10), wait_helper_async(&mut helper))
+        .await
+        .expect("helper exit within timeout");
+    assert!(status.success(), "helper exited with {status}");
+
+    let mut stdout = Vec::new();
+    helper
+        .child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_end(&mut stdout)
+        .expect("read helper stdout");
+    let out = String::from_utf8_lossy(&stdout);
+    assert!(
+        out.contains("msg49"),
+        "the last queued packet must be delivered before the disconnect; helper stdout:\n{out}"
+    );
 }

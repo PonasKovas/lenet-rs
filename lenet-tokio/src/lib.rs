@@ -22,11 +22,13 @@
 //! and retried once the socket becomes writable, and the host's outgoing
 //! queue applies backpressure to the protocol engine in the meantime.
 //!
-//! # Backpressure
+//! # Backpressure and ordering
 //!
 //! [`Connection::send`] queues into a bounded command channel and truly
-//! awaits when it is full. The connection-level event queue behavior is
-//! configurable via [`EventQueuePolicy`].
+//! awaits when it is full. Per-connection operations preserve FIFO order:
+//! a `send` followed by `disconnect` (or `disconnect_later`) is applied in
+//! exactly that order by the driver. The connection-level event queue
+//! behavior is configurable via [`EventQueuePolicy`].
 //!
 //! # Handle safety
 //!
@@ -36,10 +38,13 @@
 //! reused) fails closed: [`Connection::send`] returns [`SendError::Closed`]
 //! and the pump ignores commands from stale tokens. Dropping a
 //! [`Connection`] (or all halves of a [`Connection::split`]) gracefully
-//! disconnects its peer.
+//! disconnects its peer. Dropping a [`Connecting`] future cancels the
+//! pending handshake immediately, freeing the peer slot.
 //!
 //! Threading contract: one host, one thread — the pump task is that thread;
-//! application handles only exchange messages with it.
+//! application handles only exchange messages with it. The driver shuts
+//! down when the last handle (endpoint, accept queue, or connection) is
+//! dropped, which it observes via command-channel closure.
 //!
 //! # Example
 //!
@@ -51,7 +56,7 @@
 //!
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let endpoint = Endpoint::start(LenetConfig::new()).await?;
-//! let server = "127.0.0.1:9000".parse()?;
+//! let server: std::net::SocketAddrV4 = "127.0.0.1:9000".parse()?;
 //!
 //! let mut conn = endpoint.connect(server, 2, 0x1234)?.await?;
 //! conn.send(0, SendFlags::RELIABLE, b"hello".to_vec()).await?;
@@ -110,10 +115,10 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -235,9 +240,9 @@ impl LenetConfig {
 /// Errors from [`Endpoint::connect`] and awaiting [`Connecting`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum ConnectError {
-    /// The engine refused the attempt (no free peer slot), or the remote
-    /// address is IPv6 (Lenet is IPv4-only).
-    #[error("connection rejected (no free peer slot, or IPv6 address)")]
+    /// The engine refused the attempt (no free peer slot, or an invalid
+    /// channel count).
+    #[error("connection rejected (no free peer slot)")]
     Rejected,
     /// The handshake never completed: the remote refused, or the attempt
     /// timed out per the peer timeout configuration.
@@ -276,20 +281,28 @@ pub enum ConnEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Token(u64);
 
-/// Channels shared by all user-facing handles. The `handles` Arc's strong
-/// count tracks live external handles; the pump shuts down when only its
-/// own copy remains.
-#[derive(Clone, Debug)]
+/// Allocates a fresh generation token. Process-global so that
+/// [`Endpoint::connect`] can mint the token user-side: the [`Connecting`]
+/// future needs it to cancel the attempt if dropped before resolving.
+fn alloc_token() -> Token {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    Token(NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Channels shared by all user-facing handles. Held via `Arc` by every
+/// handle (endpoints, accept queues, connections); the pump holds only a
+/// `Weak`, so both command channels close — and the pump shuts down —
+/// exactly when the last handle is dropped.
+#[derive(Debug)]
 struct Shared {
     /// Control commands: never dropped or backpressured (low rate, tiny).
+    /// Carries nothing that must stay ordered with respect to a
+    /// connection's queued `send`s.
     ctrl_tx: mpsc::UnboundedSender<Command>,
-    /// Bulk data commands (`send`/`broadcast`): bounded, provides real
-    /// backpressure to `Connection::send`.
+    /// Bulk data commands (`send`/`broadcast`/`disconnect`): bounded,
+    /// provides real backpressure to `Connection::send`, and preserves
+    /// per-connection FIFO order between those operations.
     data_tx: mpsc::Sender<Command>,
-    /// Only cloned, never read: its Arc strong count is the live-handle
-    /// registry the pump polls (see `Pump::run`).
-    #[allow(dead_code)]
-    handles: Arc<()>,
 }
 
 impl Shared {
@@ -299,6 +312,21 @@ impl Shared {
 
     async fn send_data(&self, cmd: Command) -> Result<(), SendError> {
         self.data_tx.send(cmd).await.map_err(|_| SendError::Closed)
+    }
+
+    /// Enqueues `cmd` from a non-async context (`Drop`). Prefers the data
+    /// channel so per-connection FIFO order with queued `send`s is kept;
+    /// when it is full, falls back to the control channel — the command
+    /// may then overtake queued packets, which beats leaking a connected
+    /// peer until timeout.
+    fn send_ordered_lossy(&self, cmd: Command) {
+        match self.data_tx.try_send(cmd) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                let _ = self.ctrl_tx.send(cmd);
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+        }
     }
 }
 
@@ -313,10 +341,18 @@ type ConnParts = (Token, PeerId, EventRx, SocketAddrV4, Arc<AtomicBool>);
 
 enum Command {
     Connect {
+        token: Token,
         addr: SocketAddrV4,
         channel_count: usize,
         data: u32,
         done: oneshot::Sender<Result<ConnParts, ConnectError>>,
+    },
+    /// Cancels a connect attempt whose [`Connecting`] future was dropped
+    /// before resolving: frees the pending peer slot (or tears down a peer
+    /// whose handshake completed between resolution and the future being
+    /// dropped) instead of retransmitting until the peer timeout.
+    CancelConnect {
+        token: Token,
     },
     Send {
         token: Token,
@@ -329,7 +365,15 @@ enum Command {
         flags: SendFlags,
         data: Bytes,
     },
+    /// Sent on the data channel so it stays FIFO-ordered after any `send`s
+    /// the application queued on the same connection.
     Disconnect {
+        token: Token,
+        data: u32,
+    },
+    /// `Host::disconnect_later` (ENet parity): flush queued packets, then
+    /// disconnect once they are delivered. Ordered like [`Command::Disconnect`].
+    DisconnectLater {
         token: Token,
         data: u32,
     },
@@ -423,7 +467,7 @@ fn make_queue(policy: &EventQueuePolicy) -> (EventTx, EventRx) {
 /// [`Endpoint::listen`] to obtain an [`AcceptQueue`].
 #[derive(Clone, Debug)]
 pub struct Endpoint {
-    shared: Shared,
+    shared: Arc<Shared>,
     local_addr: SocketAddr,
     /// Capacity for accept queues created by [`Endpoint::listen`].
     accept_channel: usize,
@@ -432,7 +476,8 @@ pub struct Endpoint {
 impl Endpoint {
     /// Starts the driver task: binds the socket and spawns the pump loop.
     /// The driver runs until [`Endpoint::shutdown`] is called or every
-    /// handle to it is dropped. For the server role, call [`Endpoint::listen`]
+    /// handle to it is dropped (the pump notices via command-channel
+    /// closure). For the server role, call [`Endpoint::listen`]
     /// (promptly — until an accept queue is registered, incoming
     /// connections are rejected) to start receiving incoming connections.
     pub async fn start(config: LenetConfig) -> std::io::Result<Endpoint> {
@@ -447,13 +492,8 @@ impl Endpoint {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let (data_tx, data_rx) = mpsc::channel(config.cmd_channel.max(1));
         let accept_channel = config.accept_channel.max(1);
-        let handles = Arc::new(());
 
-        let shared = Shared {
-            ctrl_tx: ctrl_tx.clone(),
-            data_tx: data_tx.clone(),
-            handles: Arc::clone(&handles),
-        };
+        let shared = Arc::new(Shared { ctrl_tx, data_tx });
 
         tokio::spawn(
             Pump {
@@ -461,13 +501,13 @@ impl Endpoint {
                 socket,
                 config,
                 udp_buf: vec![0u8; 64 * 1024],
-                ctrl_tx,
+                // No strong reference: when the last handle drops, both
+                // command channels close and the pump's `select!` sees
+                // `None` on both receivers.
+                shared: Arc::downgrade(&shared),
                 ctrl_rx,
-                data_tx,
                 data_rx,
                 accept_txs: Vec::new(),
-                handles,
-                next_token: 0,
                 peers: HashMap::new(),
                 tokens: HashMap::new(),
                 pending: HashMap::new(),
@@ -516,7 +556,7 @@ impl Endpoint {
         ack_rx.await.map_err(|_| SendError::Closed)?;
         Ok(AcceptQueue {
             rx,
-            _handles: Arc::clone(&self.shared.handles),
+            _shared: Arc::clone(&self.shared),
         })
     }
 
@@ -526,26 +566,25 @@ impl Endpoint {
     /// or fails/times out (yielding [`ConnectError::TimedOut`]).
     ///
     /// Dropping the [`Connecting`] future without awaiting it cancels the
-    /// attempt (the peer is gracefully disconnected).
+    /// attempt immediately: the pump frees the peer slot (or disconnects a
+    /// peer whose handshake completed in the meantime) instead of
+    /// retransmitting until the peer timeout.
     ///
     /// # Errors
     ///
-    /// [`ConnectError::Rejected`] for IPv6 addresses (Lenet is IPv4-only)
-    /// or when the engine has no free peer slot; [`ConnectError::Closed`]
-    /// when the driver task is gone.
+    /// [`ConnectError::Rejected`] when the engine has no free peer slot;
+    /// [`ConnectError::Closed`] when the driver task is gone.
     pub fn connect(
         &self,
-        addr: SocketAddr,
+        addr: SocketAddrV4,
         channel_count: usize,
         data: u32,
     ) -> Result<Connecting, ConnectError> {
-        let addr = match addr.ip() {
-            IpAddr::V4(v4) => SocketAddrV4::new(v4, addr.port()),
-            IpAddr::V6(_) => return Err(ConnectError::Rejected),
-        };
+        let token = alloc_token();
         let (done_tx, done_rx) = oneshot::channel();
         self.shared
             .send_ctrl(Command::Connect {
+                token,
                 addr,
                 channel_count,
                 data,
@@ -553,8 +592,9 @@ impl Endpoint {
             })
             .map_err(|_| ConnectError::Closed)?;
         Ok(Connecting {
-            shared: self.shared.clone(),
-            done: done_rx,
+            shared: Arc::clone(&self.shared),
+            token,
+            done: Some(done_rx),
         })
     }
 
@@ -628,7 +668,9 @@ impl Endpoint {
 #[derive(Debug)]
 pub struct AcceptQueue {
     rx: mpsc::Receiver<Incoming>,
-    _handles: Arc<()>,
+    /// Held (never read) so the command channels stay open — and the pump
+    /// keeps running — while the queue lives.
+    _shared: Arc<Shared>,
 }
 
 impl AcceptQueue {
@@ -649,7 +691,7 @@ pub struct Incoming {
     peer_id: PeerId,
     remote_addr: SocketAddrV4,
     connect_data: u32,
-    shared: Shared,
+    shared: Arc<Shared>,
     closed: Arc<AtomicBool>,
     event_rx: Option<EventRx>,
 }
@@ -684,13 +726,13 @@ impl Incoming {
     pub fn accept(mut self) -> Connection {
         let guard = Arc::new(DisconnectGuard {
             token: self.token,
-            shared: self.shared.clone(),
+            shared: Arc::clone(&self.shared),
         });
         Connection {
             token: self.token,
             peer_id: self.peer_id,
             remote_addr: self.remote_addr,
-            shared: self.shared.clone(),
+            shared: Arc::clone(&self.shared),
             closed: Arc::clone(&self.closed),
             guard,
             event_rx: self
@@ -726,39 +768,65 @@ impl Drop for Incoming {
 /// A connection attempt in progress. Resolves to a [`Connection`] once the
 /// handshake completes, or to [`ConnectError`] if it fails or times out.
 ///
-/// Dropping it without awaiting cancels the attempt.
+/// Dropping it without awaiting cancels the attempt: the pump frees the
+/// peer slot (or disconnects a peer whose handshake completed between
+/// resolution and the drop) instead of retransmitting until the timeout.
 #[derive(Debug)]
 pub struct Connecting {
-    shared: Shared,
-    done: oneshot::Receiver<Result<ConnParts, ConnectError>>,
+    shared: Arc<Shared>,
+    token: Token,
+    /// `Some` until the handshake resolves (a successful poll takes it).
+    done: Option<oneshot::Receiver<Result<ConnParts, ConnectError>>>,
 }
 
 impl Future for Connecting {
     type Output = Result<Connection, ConnectError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.done).poll(cx).map(|res| {
-            let parts = match res {
-                Ok(Ok(parts)) => Ok(parts),
-                Ok(Err(e)) => Err(e),
-                Err(_) => Err(ConnectError::Closed),
-            };
+        let done = self
+            .done
+            .as_mut()
+            .expect("Connecting polled after completion");
+        let res = match Pin::new(done).poll(cx) {
+            Poll::Ready(res) => res,
+            Poll::Pending => return Poll::Pending,
+        };
+        self.done = None;
+        let parts = match res {
+            Ok(Ok(parts)) => Ok(parts),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(ConnectError::Closed),
+        };
+        Poll::Ready(
             parts.map(|(token, peer_id, event_rx, remote_addr, closed)| {
                 let guard = Arc::new(DisconnectGuard {
                     token,
-                    shared: self.shared.clone(),
+                    shared: Arc::clone(&self.shared),
                 });
                 Connection {
                     token,
                     peer_id,
                     remote_addr,
-                    shared: self.shared.clone(),
+                    shared: Arc::clone(&self.shared),
                     closed,
                     guard,
                     event_rx,
                 }
-            })
-        })
+            }),
+        )
+    }
+}
+
+impl Drop for Connecting {
+    fn drop(&mut self) {
+        // Still unresolved (the handshake may still be negotiating): tell
+        // the pump to cancel the attempt. A no-op once the future resolved
+        // (a poll took `done`).
+        if self.done.take().is_some() {
+            let _ = self
+                .shared
+                .send_ctrl(Command::CancelConnect { token: self.token });
+        }
     }
 }
 
@@ -767,14 +835,15 @@ impl Future for Connecting {
 #[derive(Debug)]
 struct DisconnectGuard {
     token: Token,
-    shared: Shared,
+    shared: Arc<Shared>,
 }
 
 impl Drop for DisconnectGuard {
     fn drop(&mut self) {
         // Dropping the last handle to a peer disconnects it gracefully
-        // instead of leaking a zombie connection until timeout.
-        let _ = self.shared.send_ctrl(Command::Disconnect {
+        // instead of leaking a zombie connection until timeout. Ordered
+        // with queued `send`s when the data channel has room.
+        self.shared.send_ordered_lossy(Command::Disconnect {
             token: self.token,
             data: 0,
         });
@@ -794,7 +863,7 @@ pub struct Connection {
     token: Token,
     peer_id: PeerId,
     remote_addr: SocketAddrV4,
-    shared: Shared,
+    shared: Arc<Shared>,
     closed: Arc<AtomicBool>,
     guard: Arc<DisconnectGuard>,
     event_rx: EventRx,
@@ -846,7 +915,12 @@ impl Connection {
             .await
     }
 
-    /// Begins a graceful disconnect carrying `data`.
+    /// Begins a graceful disconnect carrying `data`. Ordered after any
+    /// packets queued by earlier `send` calls on this connection.
+    ///
+    /// Note the engine does not wait for queued packets to be delivered —
+    /// use [`Connection::disconnect_later`] for a flush-then-disconnect
+    /// close.
     ///
     /// # Errors
     ///
@@ -856,10 +930,33 @@ impl Connection {
         if self.event_rx.is_dead() || self.closed.load(Ordering::Acquire) {
             return Err(SendError::Closed);
         }
-        self.shared.send_ctrl(Command::Disconnect {
-            token: self.token,
-            data,
-        })
+        self.shared
+            .send_data(Command::Disconnect {
+                token: self.token,
+                data,
+            })
+            .await
+    }
+
+    /// Begins a graceful disconnect carrying `data` after flushing: queued
+    /// packets are delivered (and acknowledged) before the peer is torn
+    /// down — `enet_peer_disconnect_later` semantics. Ordered after any
+    /// packets queued by earlier `send` calls on this connection.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::Closed`] if the connection is already closed or stale,
+    /// or the driver task is gone.
+    pub async fn disconnect_later(&self, data: u32) -> Result<(), SendError> {
+        if self.event_rx.is_dead() || self.closed.load(Ordering::Acquire) {
+            return Err(SendError::Closed);
+        }
+        self.shared
+            .send_data(Command::DisconnectLater {
+                token: self.token,
+                data,
+            })
+            .await
     }
 
     /// Waits for the next event on this connection: `None` once the
@@ -883,7 +980,7 @@ impl Connection {
             token: self.token,
             peer_id: self.peer_id,
             remote_addr: self.remote_addr,
-            shared: self.shared.clone(),
+            shared: Arc::clone(&self.shared),
             closed: Arc::clone(&self.closed),
             guard: Arc::clone(&self.guard),
         };
@@ -904,7 +1001,7 @@ pub struct ConnectionSender {
     token: Token,
     peer_id: PeerId,
     remote_addr: SocketAddrV4,
-    shared: Shared,
+    shared: Arc<Shared>,
     closed: Arc<AtomicBool>,
     /// Held (never read) so the peer is disconnected when the last half is
     /// dropped — see [`DisconnectGuard`].
@@ -951,7 +1048,8 @@ impl ConnectionSender {
             .await
     }
 
-    /// Begins a graceful disconnect carrying `data`.
+    /// Begins a graceful disconnect carrying `data`. Ordered after any
+    /// packets queued by earlier `send` calls on this connection.
     ///
     /// # Errors
     ///
@@ -961,10 +1059,32 @@ impl ConnectionSender {
         if self.closed.load(Ordering::Acquire) {
             return Err(SendError::Closed);
         }
-        self.shared.send_ctrl(Command::Disconnect {
-            token: self.token,
-            data,
-        })
+        self.shared
+            .send_data(Command::Disconnect {
+                token: self.token,
+                data,
+            })
+            .await
+    }
+
+    /// Begins a graceful disconnect carrying `data` after flushing queued
+    /// packets (`enet_peer_disconnect_later` semantics). Ordered after any
+    /// packets queued by earlier `send` calls on this connection.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::Closed`] if the connection is already closed or stale,
+    /// or the driver task is gone.
+    pub async fn disconnect_later(&self, data: u32) -> Result<(), SendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(SendError::Closed);
+        }
+        self.shared
+            .send_data(Command::DisconnectLater {
+                token: self.token,
+                data,
+            })
+            .await
     }
 }
 
@@ -1007,26 +1127,26 @@ struct Pump {
     socket: UdpSocket,
     config: LenetConfig,
     udp_buf: Vec<u8>,
-    ctrl_tx: mpsc::UnboundedSender<Command>,
+    /// Senders, upgraded only to hand them to a new [`Incoming`]. No strong
+    /// reference is held: when the last handle drops, both command channels
+    /// close and the pump's `select!` sees `None` on both receivers.
+    shared: Weak<Shared>,
     ctrl_rx: mpsc::UnboundedReceiver<Command>,
-    data_tx: mpsc::Sender<Command>,
     data_rx: mpsc::Receiver<Command>,
     /// Accept queues registered via [`Endpoint::listen`]. Incoming
     /// connections go to the first queue with capacity; an empty list (no
     /// listener yet) rejects every incoming connection.
     accept_txs: Vec<mpsc::Sender<Incoming>>,
-    /// Strong-count handle registry: the pump's own copy plus one per live
-    /// external handle (endpoints, accept queues, connections). When only
-    /// the pump's copy remains, shut down.
-    handles: Arc<()>,
-    next_token: u64,
     peers: HashMap<PeerId, PeerEntry>,
     tokens: HashMap<Token, PeerId>,
     pending: HashMap<PeerId, PendingConnect>,
     /// Source address of the most recent inbound datagram. A CONNECT event
-    /// can only originate from the datagram handled in the same pump
-    /// iteration, so this is the remote address of any incoming connection
-    /// dispatched right after.
+    /// can only be produced by datagram command processing (the engine
+    /// emits `Event.connect` solely from `Peer.processCommand` — incoming
+    /// CONNECT or its VERIFY_CONNECT ack; `service()` only ever yields
+    /// disconnect/receive events), and datagrams are handled one per pump
+    /// iteration with events dispatched right after, so this is the remote
+    /// address of any incoming connection dispatched in the same pass.
     last_from: SocketAddrV4,
     /// Staging buffer for the next outgoing datagram (see
     /// [`Pump::flush_outgoing`]).
@@ -1076,11 +1196,6 @@ enum OwnedEvent {
 }
 
 impl Pump {
-    fn alloc_token(&mut self) -> Token {
-        self.next_token += 1;
-        Token(self.next_token)
-    }
-
     fn register_peer(
         &mut self,
         peer: PeerId,
@@ -1119,11 +1234,6 @@ impl Pump {
         let mut fallback_due = TokioInstant::from_std(Instant::now()) + self.config.fallback_tick;
 
         while !self.shutdown {
-            // All external handles dropped? Shut down.
-            if Arc::strong_count(&self.handles) == 1 {
-                break;
-            }
-
             // Deadline-driven tick: wake at the host's next timer deadline
             // if there is one, otherwise at the fallback tick.
             let wake = self
@@ -1154,8 +1264,8 @@ impl Pump {
                     match ctrl {
                         Some(Command::Shutdown) => self.shutdown = true,
                         Some(cmd) => self.apply_command(cmd),
-                        // The pump itself holds a sender; unreachable, but
-                        // treat defensively as shutdown.
+                        // All handles dropped: the command channels are
+                        // closed (the pump holds no senders).
                         None => self.shutdown = true,
                     }
                 }
@@ -1213,6 +1323,7 @@ impl Pump {
     fn apply_command(&mut self, cmd: Command) {
         match cmd {
             Command::Connect {
+                token,
                 addr,
                 channel_count,
                 data,
@@ -1222,7 +1333,6 @@ impl Pump {
                     let _ = done.send(Err(ConnectError::Rejected));
                     return;
                 };
-                let token = self.alloc_token();
                 let (event_tx, event_rx) = make_queue(&self.config.event_queue);
                 self.apply_peer_timeout(peer);
                 self.pending.insert(
@@ -1236,6 +1346,25 @@ impl Pump {
                         done,
                     },
                 );
+            }
+            Command::CancelConnect { token } => {
+                let pending_peer = self
+                    .pending
+                    .iter()
+                    .find_map(|(peer, p)| (p.token == token).then_some(*peer));
+                if let Some(peer) = pending_peer {
+                    // The handshake is still negotiating: free the peer
+                    // slot now instead of retransmitting until timeout.
+                    self.pending.remove(&peer);
+                    self.host.disconnect(peer, 0);
+                } else if let Some(peer) = self.resolve(token) {
+                    // The handshake completed while the dropped future was
+                    // between resolution and poll: no Connection was ever
+                    // handed out, so tear the peer down.
+                    self.remove_peer(peer);
+                    self.host.disconnect(peer, 0);
+                }
+                // else: already gone (failed, timed out) — nothing to do.
             }
             Command::Send {
                 token,
@@ -1266,6 +1395,11 @@ impl Pump {
                     // queue closes when it is dispatched.
                 }
             }
+            Command::DisconnectLater { token, data } => {
+                if let Some(peer) = self.resolve(token) {
+                    self.host.disconnect_later(peer, data);
+                }
+            }
             Command::Shutdown => self.shutdown = true,
             Command::Listen { tx, ack } => {
                 self.accept_txs.push(tx);
@@ -1277,8 +1411,13 @@ impl Pump {
         }
     }
 
-    /// Drains every queued command and reject without awaiting, so a burst
-    /// of application traffic can never starve socket I/O or timers.
+    /// Drains every queued command without awaiting, so a burst of
+    /// application traffic can never starve socket I/O or timers.
+    ///
+    /// The two channels carry independent concerns (control vs bulk data),
+    /// so relative order between them does not matter: per-connection
+    /// causality (send vs disconnect) is preserved by routing both through
+    /// the data channel.
     fn drain(&mut self) {
         while let Ok(cmd) = self.ctrl_rx.try_recv() {
             if let Command::Shutdown = cmd {
@@ -1380,22 +1519,26 @@ impl Pump {
                     // Incoming connection (server role): the handshake was
                     // completed by the datagram handled in this iteration,
                     // so `last_from` is its remote address.
-                    let token = self.alloc_token();
+                    let token = alloc_token();
                     let (event_tx, event_rx) = make_queue(&self.config.event_queue);
                     let closed = Arc::new(AtomicBool::new(false));
                     self.apply_peer_timeout(peer);
                     self.register_peer(peer, token, event_tx, Arc::clone(&closed));
+                    // All handles dropped mid-flight: the driver is going
+                    // away; reject instead of handing out a new handle.
+                    let Some(shared) = self.shared.upgrade() else {
+                        self.remove_peer(peer);
+                        self.host.disconnect(peer, 0);
+                        return;
+                    };
+                    self.accept_txs.retain(|tx| !tx.is_closed());
                     let mut delivered = false;
                     let mut incoming = Some(Incoming {
                         token,
                         peer_id: peer,
                         remote_addr: self.last_from,
                         connect_data: data,
-                        shared: Shared {
-                            ctrl_tx: self.ctrl_tx.clone(),
-                            data_tx: self.data_tx.clone(),
-                            handles: Arc::clone(&self.handles),
-                        },
+                        shared,
                         closed,
                         event_rx: Some(event_rx),
                     });

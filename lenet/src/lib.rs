@@ -45,8 +45,11 @@ use bitflags::bitflags;
 pub use lenet_sys as ffi;
 
 /// Maximum payload length a receive event can carry: the engine rejects
-/// reassemblies above `maximumMtu * 1024` (see `FragmentAssembler.init`),
-/// so a buffer of this size makes truncation structurally impossible.
+/// reassemblies above `maximumMtu * 1024` (`Lenet.Constants.maximumMtu`,
+/// a fixed 4096 — independent of the host's configured MTU; see
+/// `FragmentAssembler.init`), so a buffer of exactly this size makes the
+/// `payload_len <= cap` assertion in `poll_event` structurally
+/// unreachable from network input. It can only fire on a C-layer bug.
 const MAX_RECV_PAYLOAD: usize = 4096 * 1024;
 
 /// Identifies a peer within a host. Opaque newtype; ids are recycled by the
@@ -499,8 +502,11 @@ impl Host {
     /// If the C layer violates its contract (reports an event type outside
     /// `{0, 1}`, or a payload longer than the buffer capacity, which would
     /// otherwise read out of bounds). Both are engine bugs, not runtime
-    /// conditions, so they panic rather than risk memory safety or silently
-    /// swallow an event.
+    /// conditions: the buffer is sized to the engine's hard reassembly
+    /// maximum (`Constants.maximumMtu * 1024`), so no packet from a remote
+    /// peer can exceed it — a violation means memory safety is already
+    /// compromised, and panicking beats truncating data or reading out of
+    /// bounds.
     pub fn poll_event(&mut self) -> Option<Event<'_>> {
         let mut raw: ffi::lenet_event = ffi::lenet_event {
             type_: 0,

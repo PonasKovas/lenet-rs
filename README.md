@@ -26,7 +26,7 @@ docs).
 
 | crate         | purpose |
 |---------------|---------|
-| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` fetches Lenet at a pinned revision, provisions the Lean toolchain (elan) if needed, and builds `liblenet.a` automatically — the crate behaves like any normal sys crate. |
+| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` fetches Lenet (newest upstream commit) and provisions the Lean toolchain (elan) if needed, then builds `liblenet.a` automatically — the crate behaves like any normal sys crate. Set `LENET_DIR` to develop against a local Lenet checkout instead. |
 | `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out (borrowed views, zero-copy). One host, one thread. |
 | `lenet-tokio` | The async driver: stall-free pump loop, `Connecting`/`Connection`/`Incoming` handles, per-connection event queues, real send backpressure. |
 | `enet-helper` | Test oracle only: a real C ENet endpoint; fetches + builds upstream `lsalzman/enet` (pinned) automatically. |
@@ -45,8 +45,9 @@ use lenet_tokio::{ConnEvent, Endpoint, LenetConfig};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = Endpoint::start(LenetConfig::new()).await?;
 
+    let server: std::net::SocketAddrV4 = "127.0.0.1:32887".parse()?;
     let mut conn = endpoint
-        .connect("127.0.0.1:32887".parse()?, 2, 0x1234)?
+        .connect(server, 2, 0x1234)?
         .await?; // handshake completes
 
     conn.send(0, SendFlags::RELIABLE, b"hello".to_vec()).await?;
@@ -120,24 +121,28 @@ datagrams and events — is non-blocking batch work:
   backs up meanwhile — applying the same backpressure to the protocol
   engine that a slow link would. Nothing is dropped locally.
 
-**Backpressure.** `Connection::send` queues into a bounded command channel
-and genuinely awaits when it is full. Note it is fire-and-forget once
-queued: engine-level rejections (channel out of range for the negotiated
-count, packet too large) are logged by the driver and the packet dropped.
-Inbound behavior is configurable via `EventQueuePolicy`: `Unbounded`
-(default; mirrors C ENet's receive queue — events are never lost) or
-`BoundedThenDisconnect` (a full queue force-disconnects that peer with a
-configurable payload instead of dropping events or stalling). New
-*incoming* connections are rejected (graceful disconnect) when the
-`accept_channel` queue is full.
+**Backpressure and ordering.** `Connection::send` queues into a bounded
+command channel and genuinely awaits when it is full. Per-connection
+operations keep FIFO order: a `send` followed by `disconnect` (or
+`disconnect_later`) is applied in exactly that order. `disconnect_later`
+(`enet_peer_disconnect_later` semantics) flushes queued packets before
+closing. Note `send` is fire-and-forget once queued: engine-level
+rejections (channel out of range for the negotiated count, packet too
+large) are logged by the driver and the packet dropped. Inbound behavior
+is configurable via `EventQueuePolicy`: `Unbounded` (default; mirrors C
+ENet's receive queue — events are never lost) or `BoundedThenDisconnect`
+(a full queue force-disconnects that peer with a configurable payload
+instead of dropping events or stalling). New *incoming* connections are
+rejected (graceful disconnect) when the `accept_channel` queue is full.
 
 **Handle safety.** The engine recycles peer ids, so user-facing handles are
 keyed by internal generation tokens. A stale `Connection` (its peer
 disconnected and the slot was reused) fails closed: `send` returns
 `SendError::Closed` instead of silently messaging a stranger. Dropping a
 `Connection` (or all halves of a split one) gracefully disconnects its
-peer. Dropping a `Connecting` future without awaiting cancels the attempt.
-Every connection handle also exposes `remote_addr()`.
+peer. Dropping a `Connecting` future without awaiting cancels the attempt
+immediately, freeing the peer slot instead of retransmitting until the
+timeout. Every connection handle also exposes `remote_addr()`.
 
 **Sans-I/O contract.** `lenet` never touches the network or the clock; the
 tokio driver is the only place that does. This mirrors the Lean side
@@ -177,8 +182,9 @@ cargo test --workspace
 ```
 
 On the first build, `lenet-sys` clones the [Lenet](https://github.com/PonasKovas/lenet)
-repo at a pinned revision (see `LENET_REV` in `lenet-sys/build.rs`), installs
-the Lean toolchain it pins via elan if you don't have one, and compiles
+repo (tracking the newest upstream commit — every build fetches and
+fast-forwards, tolerating offline use with the existing checkout), installs
+the Lean toolchain Lenet pins via elan if you don't have one, and compiles
 `liblenet.a`; `enet-helper` clones upstream ENet at a pinned revision and
 builds it with cmake. Subsequent builds are incremental no-ops.
 
