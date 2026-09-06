@@ -142,6 +142,7 @@ Prerequisites: Rust (stable), `git`, `curl`, and a C toolchain (`cc`/`make`).
 That's it — the build scripts fetch and build everything else on first use:
 
 ```sh
+cargo build --workspace   # also produces the enet-helper interop oracle binary
 cargo test --workspace
 ```
 

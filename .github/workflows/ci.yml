@@ -44,7 +44,11 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # Builds everything from scratch on a fresh runner: lenet-sys fetches
-      # + builds Lenet (Lean) and enet-helper fetches + builds ENet; the
-      # interop tests then run against the live C ENet oracle.
+      # + builds Lenet (Lean) and enet-helper fetches + builds ENet. The
+      # plain enet-helper binary (the interop oracle) is a build artifact —
+      # `cargo test` alone only produces test harnesses.
+      - name: Build workspace (incl. the enet-helper oracle binary)
+        run: cargo build --workspace
+
       - name: Tests (sans-I/O + live ENet interop)
         run: cargo test --workspace

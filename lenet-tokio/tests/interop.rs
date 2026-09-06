@@ -4,8 +4,8 @@
 //! slow-consumer isolation, accept backpressure, connect timeout, and
 //! shutdown.
 //!
-//! Requires the `enet-helper` binary (built by `cargo test --workspace`);
-//! override its location with the `ENET_HELPER` env var.
+//! Requires the `enet-helper` binary (`cargo build --workspace` produces
+//! it); override its location with the `ENET_HELPER` env var.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -22,13 +22,19 @@ fn helper_path() -> PathBuf {
     if let Ok(p) = std::env::var("ENET_HELPER") {
         return PathBuf::from(p);
     }
-    // Fallback: workspace target dir, two levels up from this test file.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join("enet-helper")
+    // The oracle binary is a plain build artifact: `cargo test` only builds
+    // the test harness, so it must be produced by `cargo build --workspace`
+    // (the CI and README workflows do exactly that).
+    let mut dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("target")
+        });
+    dir.push("debug");
+    dir.join("enet-helper")
 }
 
 /// An `ENet` echo server (the helper's `server` mode), killed on drop.
@@ -47,7 +53,7 @@ impl Helper {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn enet-helper (build with `cargo test --workspace`)");
+            .expect("spawn enet-helper — build it first with `cargo build --workspace`");
         let mut ready = String::new();
         if wait_ready(&mut child, &mut ready, 3000) {
             Helper { child, port }
