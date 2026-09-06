@@ -4,6 +4,10 @@ Async Rust bindings for [Lenet](../lenet) — a sans-I/O implementation of the
 [ENet](http://enet.bespin.org) protocol written in Lean 4, distributed as a
 static C archive.
 
+**Documentation**: https://ponaskovas.github.io/lenet-rs/ (published
+automatically on every push to `master`; lands on the `lenet-tokio` driver
+docs).
+
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  your app                                                  │

@@ -1,0 +1,81 @@
+name: Docs
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout lenet-rs
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Lean toolchains
+        uses: actions/cache@v6
+        with:
+          path: ~/.elan/toolchains
+          key: lean-${{ runner.os }}-${{ hashFiles('lenet-sys/build.rs') }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2.9.2
+
+      # Runs the lenet-sys / enet-helper build scripts (fetch + build Lenet
+      # and ENet) as a side effect; shared caches make this cheap.
+      - name: Build docs
+        run: cargo doc --no-deps --workspace
+
+      # GitHub Pages serves target/doc at the site root; land visitors on
+      # the main crate's docs.
+      - name: Redirect site root to lenet-tokio docs
+        run: |
+          cat > target/doc/index.html <<'EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta http-equiv="refresh" content="0; url=lenet_tokio/index.html">
+            <title>lenet-rs documentation</title>
+          </head>
+          <body>
+            <a href="lenet_tokio/index.html">lenet-rs documentation</a>
+          </body>
+          </html>
+          EOF
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload docs artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: target/doc
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v5
