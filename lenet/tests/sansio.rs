@@ -1,15 +1,19 @@
 //! Unit tests: two sans-I/O hosts connected to each other, driven manually
 //! (datagrams routed by hand, time advanced by hand).
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
-use lenet::{EventKind, HostBuilder, SendFlags};
+use lenet::{Event, HostBuilder, SendFlags};
+
+fn addr(port: u16) -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+}
 
 /// Routes every outgoing datagram of `from` into `to`.
 fn route(from: &mut lenet::Host, to: &mut lenet::Host) -> usize {
     let mut sent = 0;
     while let Some(d) = from.poll_outgoing() {
-        to.handle_datagram(1000, d.ip, d.port, &d.data);
+        to.handle_datagram(1000, d.addr, d.data);
         sent += 1;
     }
     sent
@@ -36,44 +40,57 @@ fn settle(a: &mut lenet::Host, b: &mut lenet::Host) {
     panic!("hosts never quiesced");
 }
 
-/// Returns (host_a, host_b, peer id at a, peer id at b, connect data as
-/// seen by a's CONNECT event).
+/// Returns (host_a, host_b, peer id at `a`, peer id at `b`, connect data as
+/// seen by `a`'s CONNECT event).
 #[allow(clippy::type_complexity)]
-fn connect_pair() -> (lenet::Host, lenet::Host, u16, u16, u32) {
-    let mut a = HostBuilder::new().peer_count(4).channel_limit(2).build().unwrap();
-    let mut b = HostBuilder::new().peer_count(4).channel_limit(2).build().unwrap();
-    let pa = a.connect(Ipv4Addr::LOCALHOST, 1, 2, 0x77).expect("connect");
+fn connect_pair() -> (lenet::Host, lenet::Host, lenet::PeerId, lenet::PeerId, u32) {
+    let mut a = HostBuilder::new()
+        .peer_count(4)
+        .channel_limit(2)
+        .build()
+        .unwrap();
+    let mut b = HostBuilder::new()
+        .peer_count(4)
+        .channel_limit(2)
+        .build()
+        .unwrap();
+    let pa = a.connect(addr(1), 2, 0x77).expect("connect");
     settle(&mut a, &mut b);
     // Drain the connect events on both sides.
     let mut pa_ev = None;
     let mut connect_data = None;
     let mut pb_ev = None;
-    while let Some(ev) = a.poll_event(&mut []) {
-        if ev.event.kind == EventKind::Connect {
-            pa_ev = Some(ev.event.peer_id);
-            connect_data = Some(ev.event.data);
+    while let Some(ev) = a.poll_event() {
+        if let Event::Connect { peer, data } = ev {
+            pa_ev = Some(peer);
+            connect_data = Some(data);
         }
     }
-    while let Some(ev) = b.poll_event(&mut []) {
-        if ev.event.kind == EventKind::Connect {
-            pb_ev = Some(ev.event.peer_id);
+    while let Some(ev) = b.poll_event() {
+        if let Event::Connect { peer, .. } = ev {
+            pb_ev = Some(peer);
         }
     }
     assert_eq!(pa_ev, Some(pa));
-    (a, b, pa, pb_ev.expect("b should have seen a connect"), connect_data.expect("connect data"))
+    (
+        a,
+        b,
+        pa,
+        pb_ev.expect("b should have seen a connect"),
+        connect_data.expect("connect data"),
+    )
 }
 
 #[test]
 fn handshake_and_connect_data() {
     let (mut a, mut b, pa, pb, connect_data) = connect_pair();
-    assert_eq!(pa, 0);
-    assert_eq!(pb, 0);
+    assert_eq!(pa.raw(), 0);
+    assert_eq!(pb.raw(), 0);
     // The connect payload (0x77) surfaces on both sides' CONNECT events.
     assert_eq!(connect_data, 0x77);
     // Both hosts are idle-waiting: no more events.
-    let mut buf = [0u8; 4];
-    assert!(a.poll_event(&mut buf).is_none());
-    assert!(b.poll_event(&mut buf).is_none());
+    assert!(a.poll_event().is_none());
+    assert!(b.poll_event().is_none());
 }
 
 #[test]
@@ -81,19 +98,33 @@ fn reliable_roundtrip() {
     let (mut a, mut b, pa, pb, _) = connect_pair();
     a.send(pa, 0, SendFlags::RELIABLE, b"hello").expect("send");
     settle(&mut a, &mut b);
-    let mut buf = [0u8; 16];
-    let ev = b.poll_event(&mut buf).expect("receive");
-    assert_eq!(ev.event.kind, EventKind::Receive);
-    assert_eq!(ev.event.channel_id, 0);
-    assert_eq!(ev.payload_len, 5);
-    assert_eq!(&buf[..5], b"hello");
+    match b.poll_event().expect("receive") {
+        Event::Receive {
+            peer,
+            channel_id,
+            payload,
+        } => {
+            assert_eq!(peer, pb);
+            assert_eq!(channel_id, 0);
+            assert_eq!(payload, b"hello");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 
     // And back the other way.
     b.send(pb, 1, SendFlags::RELIABLE, b"pong").expect("send");
     settle(&mut a, &mut b);
-    let ev = a.poll_event(&mut buf).expect("receive");
-    assert_eq!(ev.event.channel_id, 1);
-    assert_eq!(&buf[..4], b"pong");
+    match a.poll_event().expect("receive") {
+        Event::Receive {
+            channel_id,
+            payload,
+            ..
+        } => {
+            assert_eq!(channel_id, 1);
+            assert_eq!(payload, b"pong");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
 }
 
 #[test]
@@ -102,16 +133,33 @@ fn large_packet_fragments_and_reassembles() {
     let big: Vec<u8> = (0..40_000u32).map(|i| (i * 7 + (i >> 8)) as u8).collect();
     a.send(pa, 0, SendFlags::RELIABLE, &big).expect("send");
     // Relay until b has the whole thing (fragmented, many datagrams).
-    let mut buf = vec![0u8; big.len()];
     for _ in 0..100 {
         pump(&mut a, &mut b);
-        if let Some(ev) = b.poll_event(&mut buf) {
-            assert_eq!(ev.payload_len, big.len());
-            assert_eq!(&buf[..], &big[..]);
+        if let Some(Event::Receive { payload, .. }) = b.poll_event() {
+            assert_eq!(payload, &big[..]);
             return;
         }
     }
     panic!("fragmented packet never delivered");
+}
+
+/// A payload larger than the old 64 KiB event-buffer default: proves the
+/// internal receive buffer handles the full reassembled size without
+/// truncation.
+#[test]
+fn reassembly_beyond_64k_is_never_truncated() {
+    let (mut a, mut b, pa, _pb, _) = connect_pair();
+    let big: Vec<u8> = (0..100_000u32).map(|i| (i * 13 + (i >> 5)) as u8).collect();
+    a.send(pa, 0, SendFlags::RELIABLE, &big).expect("send");
+    for _ in 0..300 {
+        pump(&mut a, &mut b);
+        if let Some(Event::Receive { payload, .. }) = b.poll_event() {
+            assert_eq!(payload.len(), big.len(), "payload was truncated");
+            assert_eq!(payload, &big[..]);
+            return;
+        }
+    }
+    panic!("100 KiB fragmented packet never delivered");
 }
 
 #[test]
@@ -119,14 +167,17 @@ fn graceful_disconnect() {
     let (mut a, mut b, pa, _pb, _) = connect_pair();
     a.disconnect(pa, 42);
     settle(&mut a, &mut b);
-    let mut buf = [0u8; 4];
-    let ev = b.poll_event(&mut buf).expect("disconnect event");
-    assert_eq!(ev.event.kind, EventKind::Disconnect);
-    assert_eq!(ev.event.data, 42);
+    let ev = b.poll_event().expect("disconnect event");
+    assert_eq!(
+        ev,
+        Event::Disconnect {
+            peer: _pb,
+            data: 42
+        }
+    );
     // a (the initiator) sees its own disconnect with data 0 (ENet parity).
-    let ev = a.poll_event(&mut buf).expect("own disconnect event");
-    assert_eq!(ev.event.kind, EventKind::Disconnect);
-    assert_eq!(ev.event.data, 0);
+    let ev = a.poll_event().expect("own disconnect event");
+    assert_eq!(ev, Event::Disconnect { peer: pa, data: 0 });
 }
 
 #[test]
@@ -139,9 +190,8 @@ fn service_is_idle_stable() {
     b.service(1100);
     assert!(a.poll_outgoing().is_none());
     assert!(b.poll_outgoing().is_none());
-    let mut buf = [0u8; 4];
-    assert!(a.poll_event(&mut buf).is_none());
-    assert!(b.poll_event(&mut buf).is_none());
+    assert!(a.poll_event().is_none());
+    assert!(b.poll_event().is_none());
 }
 
 #[test]
@@ -149,4 +199,32 @@ fn keepalive_deadline_appears_when_connected() {
     let (a, _b, _pa, _pb, _) = connect_pair();
     // A connected, fully drained peer has a keepalive deadline scheduled.
     assert!(a.next_deadline().is_some());
+}
+
+#[test]
+fn send_flags_bit_ops() {
+    // UNRELIABLE is the empty set: plain sends carry no flag bits.
+    assert!(SendFlags::UNRELIABLE.is_empty());
+    assert_eq!(SendFlags::UNRELIABLE.bits(), 0);
+
+    let both = SendFlags::RELIABLE | SendFlags::UNSEQUENCED;
+    assert!(both.contains(SendFlags::RELIABLE));
+    assert!(both.contains(SendFlags::UNSEQUENCED));
+    assert!(!both.contains(SendFlags::UNRELIABLE_FRAGMENT));
+    // OR-ing with the empty set is a no-op.
+    assert_eq!(
+        SendFlags::RELIABLE | SendFlags::UNRELIABLE,
+        SendFlags::RELIABLE
+    );
+    // Bits line up with the FFI constants.
+    assert_eq!(
+        both.bits(),
+        lenet::ffi::LENET_RELIABLE | lenet::ffi::LENET_UNSEQUENCED
+    );
+    // BitAND intersects.
+    assert_eq!(both & SendFlags::RELIABLE, SendFlags::RELIABLE);
+    // Assign forms work too.
+    let mut f = SendFlags::RELIABLE;
+    f |= SendFlags::UNRELIABLE_FRAGMENT;
+    assert_eq!(f, SendFlags::RELIABLE | SendFlags::UNRELIABLE_FRAGMENT);
 }

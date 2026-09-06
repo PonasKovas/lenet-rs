@@ -6,4 +6,5 @@ license.workspace = true
 description = "Safe sans-I/O Rust API over the Lenet C distribution (ENet protocol, implemented in Lean)"
 
 [dependencies]
+bitflags = "2"
 lenet-sys = { path = "../lenet-sys" }

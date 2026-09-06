@@ -6,9 +6,11 @@ license.workspace = true
 description = "Tokio driver for the Lenet sans-I/O ENet protocol engine"
 
 [dependencies]
+bytes = "1"
 lenet = { path = "../lenet" }
+log = "0.4"
+thiserror = "2"
 tokio = { workspace = true }
-tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "process", "time"] }

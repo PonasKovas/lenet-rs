@@ -7,14 +7,14 @@ static C archive.
 ```
 ┌────────────────────────────────────────────────────────────┐
 │  your app                                                  │
-│    │ send()/disconnect()      ▲ events (CONNECT, RECEIVE…) │
-│    ▼                          │                            │
-│  lenet-tokio  one task owns: socket + host + pump loop      │
-│    │  datagrams in, events + datagrams out, time supplied   │
+│    │ Connecting / Connection / Incoming handles            │
 │    ▼                                                       │
-│  lenet        safe sans-I/O API over the C distribution     │
+│  lenet-tokio  one pump task owns: socket + host + clocks   │
+│    │  datagrams in, events + datagrams out, time supplied  │
 │    ▼                                                       │
-│  lenet-sys     raw externs ── liblenet.a (Lean + C shim)    │
+│  lenet        safe sans-I/O API over the C distribution    │
+│    ▼                                                       │
+│  lenet-sys     raw externs ── liblenet.a (Lean + C shim)   │
 └────────────────────────────────────────────────────────────┘
 ```
 
@@ -23,50 +23,118 @@ static C archive.
 | crate         | purpose |
 |---------------|---------|
 | `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` links `liblenet.a` from `LENET_LIB_DIR` (default: the sibling `lenet` checkout's `csrc/build`). |
-| `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out. One host, one thread. |
-| `lenet-tokio` | The async driver. One tokio task owns the `UdpSocket` + `Host`: received datagrams → `handle_datagram`, `service(now)` scheduled at the host's own `next_deadline` (plus a slow fallback tick), outgoing datagrams transmitted, events forwarded on an mpsc channel. Builder-style config, `Connection` handles for send/disconnect. |
-| `enet-helper` | Test oracle only: a real C ENet endpoint (pinned upstream `lsalzman/enet @ 5a9c537`) built via the `enet` clone in the sibling directory. |
-
-## Sans-I/O contract
-
-The engine never touches the network or the clock; the tokio driver is the
-only place that does. This mirrors the Lean side (`test/Replay.lean` drives
-the core through the same primitive the driver uses: service ticks are
-scheduled at `Host.nextDeadline` between datagram arrivals).
+| `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out (borrowed views, zero-copy). One host, one thread. |
+| `lenet-tokio` | The async driver: stall-free pump loop, `Connecting`/`Connection`/`Incoming` handles, per-connection event queues, real send backpressure. |
+| `enet-helper` | Test oracle only: a real C ENet endpoint (pinned upstream `lsalzman/enet @ 5a9c537`). |
 
 ## Usage
 
+Client role — `connect` returns a `Connecting` future that resolves when the
+handshake completes (no half-open connections):
+
 ```rust
-use std::net::SocketAddr;
 use lenet::SendFlags;
-use lenet_tokio::{Endpoint, EventKind, LenetConfig};
+use lenet_tokio::{ConnEvent, Endpoint, LenetConfig};
 
 #[tokio::main]
-async fn main() {
-    let (endpoint, mut events) =
-        Endpoint::start(LenetConfig::new()).await.expect("endpoint");
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let endpoint = Endpoint::start(LenetConfig::new()).await?;
 
-    let server: SocketAddr = "127.0.0.1:32887".parse().unwrap();
-    let conn = endpoint.connect(server, 2, 0).await.expect("connect");
+    let mut conn = endpoint
+        .connect("127.0.0.1:32887".parse()?, 2, 0x1234)
+        .await?   // queued on the driver
+        .await?;  // handshake completes
 
-    // Wait for the handshake, then send.
-    match events.recv().await.unwrap().kind {
-        EventKind::Connect => {}
-        _ => panic!(),
-    }
-    conn.send(0, SendFlags::RELIABLE, b"hello".to_vec()).await.unwrap();
+    conn.send(0, SendFlags::RELIABLE, b"hello".to_vec()).await?;
 
-    while let Some(ev) = events.recv().await {
-        if let EventKind::Receive = ev.kind {
-            println!("got {} bytes: {:?}", ev.payload.len(), &ev.payload[..]);
+    while let Some(event) = conn.recv().await {
+        match event {
+            ConnEvent::Receive { payload, .. } => {
+                println!("got {} bytes: {:?}", payload.len(), &payload[..]);
+            }
+            ConnEvent::Disconnect { .. } => break,
         }
     }
+    Ok(())
 }
 ```
 
-Threading: the host is not thread-safe (C contract: one host, one thread).
-The pump task is that thread; application handles only exchange messages
-with it.
+Server role — incoming connections arrive on an `AcceptQueue`:
+
+```rust
+use lenet::SendFlags;
+use lenet_tokio::{Endpoint, LenetConfig};
+
+async fn server() -> Result<(), Box<dyn std::error::Error>> {
+    let (endpoint, mut accepts) =
+        Endpoint::start(LenetConfig::new().bind_addr("0.0.0.0:9000".parse()?)).await?;
+    while let Some(incoming) = accepts.accept().await {
+        let connect_data = incoming.connect_data();
+        let _ = connect_data;
+        tokio::spawn(async move {
+            let mut conn = incoming.accept();
+            while let Some(ConnEvent::Receive { channel_id, payload }) = conn.recv().await {
+                let _ = conn.send(channel_id, SendFlags::RELIABLE, payload).await;
+            }
+        });
+    }
+    Ok(())
+}
+```
+
+## Design notes
+
+**Stall-free pump.** The driver's pump task awaits only in its `select!`
+(inbound datagram, host deadline, command channels). Everything else —
+dispatching commands, running timers, flushing outgoing datagrams and
+events — is non-blocking batch work:
+
+- A slow application reader fills **only its own connection's** event queue;
+  it can never stall the pump, miss the host's retransmit/keepalive
+  deadlines, or block other connections (no head-of-line blocking).
+- Outgoing datagrams go out with `try_send_to`; when the kernel socket
+  buffer is full the datagram is dropped, which is equivalent to network
+  loss (reliable traffic retransmits).
+
+**Backpressure.** `Connection::send` queues into a bounded command channel
+and genuinely awaits when it is full. Inbound behavior is configurable via
+`EventQueuePolicy`: `Unbounded` (default; mirrors C ENet's receive queue —
+events are never lost) or `BoundedThenDisconnect` (a full queue
+force-disconnects that peer with a configurable payload instead of dropping
+events or stalling). New *incoming* connections are rejected (graceful
+disconnect) when the `accept_channel` queue is full.
+
+**Handle safety.** The engine recycles peer ids, so user-facing handles are
+keyed by internal generation tokens. A stale `Connection` (its peer
+disconnected and the slot was reused) fails closed: `send` returns
+`SendError::Closed` instead of silently messaging a stranger. Dropping a
+`Connection` gracefully disconnects its peer. Dropping a `Connecting`
+future without awaiting cancels the attempt.
+
+**Sans-I/O contract.** `lenet` never touches the network or the clock; the
+tokio driver is the only place that does. This mirrors the Lean side
+(`test/Replay.lean` drives the core through the same primitive the driver
+uses: service ticks are scheduled at `Host.nextDeadline` between datagram
+arrivals). `Host::poll_event`/`poll_outgoing` return borrowed views into
+host-internal buffers — the receive buffer is pre-sized to the engine's
+hard reassembly maximum, so payloads are never truncated.
+
+**Scheduling.** Between ticks the pump sleeps until the host's
+`next_deadline` (wrap-aware, same cyclic arithmetic as `Lenet.Time`), so
+retransmit/ping/throttle timing does not depend on busy-polling. A
+configurable fallback tick (default 100 ms) bounds missed-deadline drift.
+
+**Errors.** Everything fallible is a proper `std::error::Error`:
+`lenet`'s engine-level `SendError`/`ConnectError`, and the driver-level
+`lenet_tokio::{ConnectError, SendError}` (via `thiserror`).
+
+**Shutdown.** `Endpoint::shutdown()` flushes pending outgoing traffic and
+stops the driver. Dropping every handle also stops it (without a guaranteed
+final flush).
+
+**Out of scope** (inherited from Lenet): compression (ENet's PPM range
+coder), IPv6 (datagrams from non-IPv4 sources are dropped), shared
+libraries (the Lean runtime is not `-fPIC`).
 
 ## Building & testing
 
@@ -82,31 +150,23 @@ make -C ../lenet/csrc
 cargo test --workspace
 ```
 
-The interop test (`lenet-tokio/tests/interop.rs`) spawns the `enet-helper`
-binary — a real ENet server/client — and drives a lenet-tokio endpoint
+The interop tests (`lenet-tokio/tests/interop.rs`) spawn the `enet-helper`
+binary — a real ENet server/client — and drive a lenet-tokio endpoint
 against it over live UDP:
 
-- `connect_and_reliable_echo` — handshake, reliable roundtrip, graceful disconnect with data
+- `connect_and_reliable_echo` — handshake (awaited via `Connecting`), reliable roundtrip, graceful disconnect with data
 - `fragmented_echo` — 40 KB reliable packet both directions (fragmentation on the wire)
-- `server_role_roundtrip` — Rust as the *server*: ENet client connects, Rust echoes via the event stream, disconnect data verified
+- `server_role_roundtrip` — Rust as the *server*: ENet client connects, Rust echoes, disconnect data verified
+- `stale_handle_fails_after_slot_reuse` — ABA safety: a handle from a disconnected peer fails closed after the slot is recycled
+- `slow_consumer_does_not_stall_pump` — a blocked reader cannot stall the pump; other connections keep flowing; events are buffered
+- `accept_overflow_rejects_newcomer` — with a full accept queue, new incoming connections are rejected instead of stalling
+- `connect_timeout_resolves_timed_out` — attempts to an unresponsive address resolve `TimedOut` per the configured peer timeout
+- `shutdown_closes_everything` — `Endpoint::shutdown` flushes and closes all handles
 
 `ENET_LIB_DIR`/`ENET_HELPER` env vars override the library and oracle
 locations. The helper builds ENet from `../../enet` (cmake); override by
 editing `enet-helper/build.rs` or pointing `ENET_DIR` (see `build.rs`).
 
-## Design notes
-
-- **Payload delivery**: `lenet`'s `poll_event` copies payloads into a
-  caller-supplied buffer (C API constraint); the tokio driver owns a
-  reusable buffer (default 64 KiB, configurable) and attaches owned payload
-  bytes to each delivered `DrivenEvent`. Events larger than the buffer are
-  truncated (`PolledEvent::truncated`).
-- **Scheduling**: between ticks the pump sleeps until the host's
-  `next_deadline` (wrap-aware, same cyclic arithmetic as `Lenet.Time`), so
-  retransmit/ping/throttle timing does not depend on busy-polling. A
-  configurable fallback tick (default 100 ms) bounds missed-deadline drift.
-- **Errors**: `connect`/`send` surface the C API's failure returns as typed
-  errors; everything else is infallible by contract (the engine never
-  panics — see the Lean side's no-panics gate).
-- **Out of scope** (inherited from Lenet): compression (ENet's PPM range
-  coder), shared libraries (Lean runtime is not -fPIC).
+Threading: the host is not thread-safe (C contract: one host, one thread).
+The pump task is that thread; application handles only exchange messages
+with it.
