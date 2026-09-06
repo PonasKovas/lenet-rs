@@ -1,0 +1,14 @@
+[package]
+name = "lenet-sys"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+links = "lenet"
+description = "Raw FFI bindings to the Lenet C API (sans-I/O ENet protocol implementation in Lean)"
+
+[build-dependencies]
+cc = "1"
+
+[features]
+# By default liblenet.a is looked up in LENET_LIB_DIR (or the sibling
+# lenet checkout). Set LENET_BUILD=1 to build it first via the lenet repo.

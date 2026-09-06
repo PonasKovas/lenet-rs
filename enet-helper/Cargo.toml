@@ -1,0 +1,11 @@
+[package]
+name = "enet-helper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Real C ENet endpoint used as the oracle in lenet-rs interop tests"
+publish = false
+
+[build-dependencies]
+cc = "1"
+cmake = "0.1"
