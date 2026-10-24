@@ -285,6 +285,19 @@ pub enum SendError {
     Closed,
 }
 
+/// Errors from the non-blocking [`ConnectionSender::try_send`],
+/// [`ConnectionSender::try_disconnect`], and
+/// [`ConnectionSender::try_disconnect_later`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum TrySendError {
+    /// The endpoint's command channel is full; nothing was queued.
+    #[error("command channel is full")]
+    Full,
+    /// The connection is closed or stale, or the driver task is gone.
+    #[error("connection is closed or stale")]
+    Closed,
+}
+
 /// An event on a specific [`Connection`], delivered via [`Connection::recv`].
 #[derive(Clone, Debug)]
 pub enum ConnEvent {
@@ -333,6 +346,13 @@ impl Shared {
 
     async fn send_data(&self, cmd: Command) -> Result<(), SendError> {
         self.data_tx.send(cmd).await.map_err(|_| SendError::Closed)
+    }
+
+    fn try_send_data(&self, cmd: Command) -> Result<(), TrySendError> {
+        self.data_tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => TrySendError::Full,
+            mpsc::error::TrySendError::Closed(_) => TrySendError::Closed,
+        })
     }
 
     /// Enqueues `cmd` from a non-async context (`Drop`). Prefers the data
@@ -1116,6 +1136,62 @@ impl ConnectionSender {
                 data,
             })
             .await
+    }
+
+    /// Non-blocking [`ConnectionSender::send`]: queues the packet if the
+    /// endpoint's command channel has room, otherwise fails with
+    /// [`TrySendError::Full`] without queuing anything.
+    ///
+    /// # Errors
+    ///
+    /// [`TrySendError::Full`] when the command channel is full;
+    /// [`TrySendError::Closed`] if the connection is closed or stale, or
+    /// the driver task is gone.
+    pub fn try_send(
+        &self,
+        channel: u8,
+        flags: SendFlags,
+        data: impl Into<Bytes>,
+    ) -> Result<(), TrySendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed);
+        }
+        self.shared.try_send_data(Command::Send {
+            token: self.token,
+            channel,
+            flags,
+            data: data.into(),
+        })
+    }
+
+    /// Non-blocking [`ConnectionSender::disconnect`].
+    ///
+    /// # Errors
+    ///
+    /// See [`ConnectionSender::try_send`].
+    pub fn try_disconnect(&self, data: u32) -> Result<(), TrySendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed);
+        }
+        self.shared.try_send_data(Command::Disconnect {
+            token: self.token,
+            data,
+        })
+    }
+
+    /// Non-blocking [`ConnectionSender::disconnect_later`].
+    ///
+    /// # Errors
+    ///
+    /// See [`ConnectionSender::try_send`].
+    pub fn try_disconnect_later(&self, data: u32) -> Result<(), TrySendError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TrySendError::Closed);
+        }
+        self.shared.try_send_data(Command::DisconnectLater {
+            token: self.token,
+            data,
+        })
     }
 }
 
