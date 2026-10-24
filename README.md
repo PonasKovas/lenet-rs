@@ -1,6 +1,6 @@
 # lenet-rs
 
-Async Rust bindings for [Lenet](../lenet) — a sans-I/O implementation of the
+Async Rust bindings for [Lenet](https://github.com/PonasKovas/lenet) — a sans-I/O implementation of the
 [ENet](http://enet.bespin.org) protocol written in Lean 4, distributed as a
 static C archive.
 
@@ -26,8 +26,8 @@ docs).
 
 | crate         | purpose |
 |---------------|---------|
-| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` fetches Lenet (newest upstream commit) and provisions the Lean toolchain (elan) if needed, then builds `liblenet.a` automatically — the crate behaves like any normal sys crate. Set `LENET_DIR` to develop against a local Lenet checkout instead. |
-| `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out (borrowed views, zero-copy). One host, one thread. |
+| `lenet-sys`   | Raw 1:1 FFI to `lenet.h`. `build.rs` clones Lenet at a pinned commit and builds `liblenet.a` with your Lean toolchain (elan). Set `LENET_DIR` to develop against a local Lenet checkout instead. |
+| `lenet`       | Safe sans-I/O API: `HostBuilder` → `Host`. No sockets, no clock — datagrams and `now_ms` in, events + datagrams out (borrowed views, zero-copy). Peer inspection via `Host::peer_info` (state, address, RTT). One host, one thread. |
 | `lenet-tokio` | The async driver: stall-free pump loop, `Connecting`/`Connection`/`Incoming` handles, per-connection event queues, real send backpressure. |
 | `enet-helper` | Test oracle only: a real C ENet endpoint; fetches + builds upstream `lsalzman/enet` (pinned) automatically. |
 
@@ -149,8 +149,10 @@ tokio driver is the only place that does. This mirrors the Lean side
 (`test/Replay.lean` drives the core through the same primitive the driver
 uses: service ticks are scheduled at `Host.nextDeadline` between datagram
 arrivals). `Host::poll_event`/`poll_outgoing` return borrowed views into
-host-internal buffers — the receive buffer is pre-sized to the engine's
-hard reassembly maximum, so payloads are never truncated.
+host-internal buffers — the receive buffer grows to fit any payload (up to
+ENet's 32 MB packet limit), so payloads are never truncated. The driver
+calls `Host::flush` after every pass, so ACKs and queued sends go out at
+once rather than at the next timer tick.
 
 **Scheduling.** Between ticks the pump sleeps until the host's
 `next_deadline` (wrap-aware, same cyclic arithmetic as `Lenet.Time`), so
@@ -161,9 +163,11 @@ configurable fallback tick (default 100 ms) bounds missed-deadline drift.
 `lenet`'s engine-level `SendError`/`ConnectError`, and the driver-level
 `lenet_tokio::{ConnectError, SendError}` (via `thiserror`).
 
-**Shutdown.** `Endpoint::shutdown()` flushes pending outgoing traffic and
-stops the driver. Dropping every handle also stops it (without a guaranteed
-final flush).
+**Shutdown.** `Endpoint::shutdown()` gracefully disconnects every peer,
+waits for them to acknowledge (up to `LenetConfig::shutdown_timeout`,
+default 3 s; stragglers get one last unacknowledged disconnect), flushes,
+and returns once the driver has stopped. Dropping every handle closes the
+driver the same way, just without anyone waiting for it.
 
 **Out of scope** (inherited from Lenet): compression (ENet's PPM range
 coder), IPv6 (datagrams from non-IPv4 sources are dropped), shared
@@ -171,22 +175,21 @@ libraries (the Lean runtime is not `-fPIC`).
 
 ## Building & testing
 
-Prerequisites: Rust (stable), `git`, `curl`, `cmake`, and a C toolchain
-(`cc`/`make`). That's it — the build scripts fetch and build everything
-else on first use. On NixOS, `nix-shell` (see `shell.nix`) provides
-`cmake`:
+Prerequisites: Rust (stable), `git`, `cmake`, a C toolchain (`cc`/`make`),
+and the Lean toolchain manager [elan](https://github.com/leanprover/elan#installation)
+(it fetches the exact Lean version Lenet pins on first use). The build
+scripts never install anything themselves. On NixOS, `nix-shell` (see
+`shell.nix`) provides `cmake`:
 
 ```sh
-cargo build --workspace   # also produces the enet-helper interop oracle binary
 cargo test --workspace
 ```
 
 On the first build, `lenet-sys` clones the [Lenet](https://github.com/PonasKovas/lenet)
-repo (tracking the newest upstream commit — every build fetches and
-fast-forwards, tolerating offline use with the existing checkout), installs
-the Lean toolchain Lenet pins via elan if you don't have one, and compiles
-`liblenet.a`; `enet-helper` clones upstream ENet at a pinned revision and
-builds it with cmake. Subsequent builds are incremental no-ops.
+repo at the commit pinned in `lenet-sys/build.rs` (`LENET_REV`; bump it
+together with the FFI declarations) and compiles `liblenet.a`;
+`enet-helper` clones upstream ENet at a pinned revision and builds it with
+cmake. Builds are reproducible and, after the first, work offline.
 
 **Developing against a local Lenet/ENet checkout** (e.g. iterating on the
 Lean side): point the build scripts at your checkouts and they build from
@@ -211,10 +214,10 @@ against it over live UDP:
 - `slow_consumer_does_not_stall_pump` — a blocked reader cannot stall the pump; other connections keep flowing; events are buffered
 - `accept_overflow_rejects_newcomer` — with a full accept queue, new incoming connections are rejected instead of stalling
 - `connect_timeout_resolves_timed_out` — attempts to an unresponsive address resolve `TimedOut` per the configured peer timeout
-- `shutdown_closes_everything` — `Endpoint::shutdown` flushes and closes all handles
+- `shutdown_closes_everything` — `Endpoint::shutdown` disconnects the remote gracefully, waits for the driver to stop, and closes all handles
 
-`ENET_HELPER` overrides the oracle binary location (the tests use a
-prebuilt one from `target/debug` when present). `LENET_DIR`/`ENET_DIR`
+The tests build the `enet-helper` binary themselves on first use;
+`ENET_HELPER` points them at a prebuilt one instead. `LENET_DIR`/`ENET_DIR`
 override the source checkouts, as shown above.
 
 Threading: the host is not thread-safe (C contract: one host, one thread).

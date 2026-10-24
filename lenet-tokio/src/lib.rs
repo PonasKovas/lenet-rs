@@ -42,9 +42,16 @@
 //! pending handshake immediately, freeing the peer slot.
 //!
 //! Threading contract: one host, one thread — the pump task is that thread;
-//! application handles only exchange messages with it. The driver shuts
-//! down when the last handle (endpoint, accept queue, or connection) is
-//! dropped, which it observes via command-channel closure.
+//! application handles only exchange messages with it.
+//!
+//! # Shutdown
+//!
+//! [`Endpoint::shutdown`] gracefully disconnects every peer, waits (up to
+//! [`LenetConfig::shutdown_timeout`]) for the disconnects to be
+//! acknowledged, flushes, and resolves once the driver has stopped. The
+//! driver also closes the same way when the last handle (endpoint, accept
+//! queue, or connection) is dropped, which it observes via command-channel
+//! closure.
 //!
 //! # Example
 //!
@@ -115,7 +122,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -154,6 +161,10 @@ pub struct LenetConfig {
     /// maximum)` in the units of `enet_peer_timeout`. `None` = engine
     /// defaults (32, 5000, 30000).
     peer_timeout: Option<(u32, u32, u32)>,
+    /// How long a shutdown waits for peers to acknowledge their
+    /// disconnects before ending the remaining connections at once.
+    /// Default 3 s.
+    shutdown_timeout: Duration,
 }
 
 /// Queue behavior for a connection's event queue ([`Connection::recv`]).
@@ -182,6 +193,7 @@ impl Default for LenetConfig {
             accept_channel: 64,
             event_queue: EventQueuePolicy::Unbounded,
             peer_timeout: None,
+            shutdown_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -233,6 +245,15 @@ impl LenetConfig {
     #[must_use]
     pub fn peer_timeout(mut self, limit: u32, minimum: u32, maximum: u32) -> Self {
         self.peer_timeout = Some((limit, minimum, maximum));
+        self
+    }
+
+    /// How long [`Endpoint::shutdown`] (or dropping every handle) waits for
+    /// peers to acknowledge their disconnects. Peers still connected after
+    /// it are sent one last unacknowledged disconnect and dropped.
+    #[must_use]
+    pub fn shutdown_timeout(mut self, timeout: Duration) -> Self {
+        self.shutdown_timeout = timeout;
         self
     }
 }
@@ -351,9 +372,7 @@ enum Command {
     /// before resolving: frees the pending peer slot (or tears down a peer
     /// whose handshake completed between resolution and the future being
     /// dropped) instead of retransmitting until the peer timeout.
-    CancelConnect {
-        token: Token,
-    },
+    CancelConnect { token: Token },
     Send {
         token: Token,
         channel: u8,
@@ -367,17 +386,13 @@ enum Command {
     },
     /// Sent on the data channel so it stays FIFO-ordered after any `send`s
     /// the application queued on the same connection.
-    Disconnect {
-        token: Token,
-        data: u32,
-    },
+    Disconnect { token: Token, data: u32 },
     /// `Host::disconnect_later` (ENet parity): flush queued packets, then
     /// disconnect once they are delivered. Ordered like [`Command::Disconnect`].
-    DisconnectLater {
-        token: Token,
-        data: u32,
-    },
-    Shutdown,
+    DisconnectLater { token: Token, data: u32 },
+    /// Starts the graceful close (see [`Endpoint::shutdown`]); `done`
+    /// fires once the pump has stopped.
+    Shutdown { done: oneshot::Sender<()> },
     /// Registers a new accept queue ([`Endpoint::listen`]). The pump acks
     /// once the queue is live, so incoming connections can no longer be
     /// missed between `listen()` being called and returning.
@@ -511,10 +526,13 @@ impl Endpoint {
                 peers: HashMap::new(),
                 tokens: HashMap::new(),
                 pending: HashMap::new(),
-                last_from: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
                 out_buf: BytesMut::new(),
                 out_pending: None,
-                shutdown: false,
+                recv_paused_until: None,
+                ctrl_open: true,
+                data_open: true,
+                closing: None,
+                shutdown_waiters: Vec::new(),
             }
             .run(),
         );
@@ -643,16 +661,29 @@ impl Endpoint {
         }
     }
 
-    /// Flushes pending outgoing traffic and stops the driver task. All
-    /// [`Connection`]s see their queues drain and close. Dropping the
-    /// endpoint (and all other handles) also stops the driver, but without
-    /// a guaranteed final flush.
+    /// Gracefully closes the endpoint and waits for the driver to stop.
+    ///
+    /// Every peer is sent a graceful disconnect (data 0); the driver keeps
+    /// running until all of them have acknowledged it or
+    /// [`LenetConfig::shutdown_timeout`] passes, then ends any remaining
+    /// connections at once, flushes, and stops. New connections are
+    /// refused meanwhile. Every [`Connection`] sees its
+    /// [`ConnEvent::Disconnect`] (when acknowledged in time) and then the
+    /// end of its queue; later sends return [`SendError::Closed`].
+    ///
+    /// Dropping every handle closes the driver the same way, just without
+    /// anyone waiting for it.
     ///
     /// # Errors
     ///
     /// [`SendError::Closed`] when the driver task is already gone.
     pub async fn shutdown(&self) -> Result<(), SendError> {
-        self.shared.send_ctrl(Command::Shutdown)
+        let (done_tx, done_rx) = oneshot::channel();
+        self.shared.send_ctrl(Command::Shutdown { done: done_tx })?;
+        // The pump drops `done` (instead of firing it) only if it panicked;
+        // either way it is gone, which is what the caller waits for.
+        let _ = done_rx.await;
+        Ok(())
     }
 }
 
@@ -1140,21 +1171,27 @@ struct Pump {
     peers: HashMap<PeerId, PeerEntry>,
     tokens: HashMap<Token, PeerId>,
     pending: HashMap<PeerId, PendingConnect>,
-    /// Source address of the most recent inbound datagram. A CONNECT event
-    /// can only be produced by datagram command processing (the engine
-    /// emits `Event.connect` solely from `Peer.processCommand` — incoming
-    /// CONNECT or its VERIFY_CONNECT ack; `service()` only ever yields
-    /// disconnect/receive events), and datagrams are handled one per pump
-    /// iteration with events dispatched right after, so this is the remote
-    /// address of any incoming connection dispatched in the same pass.
-    last_from: SocketAddrV4,
     /// Staging buffer for the next outgoing datagram (see
     /// [`Pump::flush_outgoing`]).
     out_buf: BytesMut,
     /// `Some((len, dest))` while a datagram staged in `out_buf` is waiting
     /// for the socket to become writable.
     out_pending: Option<(usize, SocketAddrV4)>,
-    shutdown: bool,
+    /// Set after a socket receive error: the receive branch stays off
+    /// until then, so a persistent error cannot spin the pump (and the
+    /// pump never sleeps outside its `select!`).
+    recv_paused_until: Option<TokioInstant>,
+    /// False once the control channel reported closure (all handles gone),
+    /// so its `select!` branch stops firing.
+    ctrl_open: bool,
+    /// Same for the data channel.
+    data_open: bool,
+    /// `Some(deadline)` once the graceful close has started (shutdown
+    /// requested or every handle dropped): the pump runs until every peer
+    /// is gone or `deadline` passes.
+    closing: Option<TokioInstant>,
+    /// Callers of [`Endpoint::shutdown`], told once the pump has stopped.
+    shutdown_waiters: Vec<oneshot::Sender<()>>,
 }
 
 struct PeerEntry {
@@ -1231,56 +1268,71 @@ impl Pump {
     }
 
     async fn run(mut self) {
-        let mut fallback_due = TokioInstant::from_std(Instant::now()) + self.config.fallback_tick;
+        let mut fallback_due = TokioInstant::now() + self.config.fallback_tick;
 
-        while !self.shutdown {
+        loop {
+            if let Some(deadline) = self.closing {
+                if self.peers.is_empty() || TokioInstant::now() >= deadline {
+                    break;
+                }
+            }
+
             // Deadline-driven tick: wake at the host's next timer deadline
-            // if there is one, otherwise at the fallback tick.
-            let wake = self
+            // if there is one, otherwise at the fallback tick (and never
+            // later than the end of a graceful close).
+            let mut wake = self
                 .host
                 .next_deadline()
                 .map(deadline_instant)
                 .unwrap_or(fallback_due)
                 .min(fallback_due);
+            if let Some(deadline) = self.closing {
+                wake = wake.min(deadline);
+            }
+            let recv_paused_until = self.recv_paused_until;
 
             tokio::select! {
-                // Inbound datagram.
-                recv = self.socket.recv_from(&mut self.udp_buf) => {
+                // Inbound datagram (off for a moment after a socket error).
+                recv = self.socket.recv_from(&mut self.udp_buf), if recv_paused_until.is_none() => {
                     match recv {
                         Ok((n, from)) => self.handle_inbound(n, from),
                         Err(e) => {
                             log::warn!("lenet-tokio: recv error: {e}");
-                            sleep_until(
-                                TokioInstant::from_std(Instant::now())
-                                    + Duration::from_millis(10),
-                            )
-                            .await;
-                            continue;
+                            self.recv_paused_until =
+                                Some(TokioInstant::now() + Duration::from_millis(10));
                         }
                     }
                 }
+                _ = sleep_until(recv_paused_until.unwrap_or_else(TokioInstant::now)), if recv_paused_until.is_some() => {
+                    self.recv_paused_until = None;
+                }
                 // Control command from application handles.
-                ctrl = self.ctrl_rx.recv() => {
+                ctrl = self.ctrl_rx.recv(), if self.ctrl_open => {
                     match ctrl {
-                        Some(Command::Shutdown) => self.shutdown = true,
                         Some(cmd) => self.apply_command(cmd),
                         // All handles dropped: the command channels are
                         // closed (the pump holds no senders).
-                        None => self.shutdown = true,
+                        None => {
+                            self.ctrl_open = false;
+                            self.start_closing();
+                        }
                     }
                 }
                 // Bulk data command.
-                cmd = self.data_rx.recv() => {
+                cmd = self.data_rx.recv(), if self.data_open => {
                     match cmd {
                         Some(cmd) => self.apply_command(cmd),
-                        None => self.shutdown = true,
+                        None => {
+                            self.data_open = false;
+                            self.start_closing();
+                        }
                     }
                 }
-                // Timer branch: a deadline (host or fallback) came due.
+                // Timer branch: a deadline (host, fallback, or end of the
+                // graceful close) came due.
                 _ = sleep_until(wake) => {
                     self.host.service(now_ms());
-                    fallback_due =
-                        TokioInstant::from_std(Instant::now()) + self.config.fallback_tick;
+                    fallback_due = TokioInstant::now() + self.config.fallback_tick;
                 }
                 // Socket send-buffer drained: retry the staged datagram.
                 // (Only armed while `flush_outgoing` left one pending; the
@@ -1295,15 +1347,65 @@ impl Pump {
             }
 
             self.drain();
+            // Pack ACKs for any datagram just handled and anything the
+            // commands queued; the engine only emits datagrams on flush or
+            // service.
+            self.host.flush(now_ms());
             self.flush_outgoing();
             self.flush_events();
         }
 
-        // Final drain + flush: deliver everything queued (e.g. reliable
-        // sends flushed by a disconnect) before the host is destroyed.
+        self.finish().await;
+    }
+
+    /// Begins the graceful close: disconnects every peer, fails pending
+    /// connect attempts, and sets the deadline the run loop waits for.
+    /// Idempotent.
+    fn start_closing(&mut self) {
+        if self.closing.is_some() {
+            return;
+        }
+        self.closing = Some(TokioInstant::now() + self.config.shutdown_timeout);
+        for (peer, pending) in self.pending.drain() {
+            let _ = pending.done.send(Err(ConnectError::Closed));
+            self.host.disconnect(peer, 0);
+        }
+        let peers: Vec<PeerId> = self.peers.keys().copied().collect();
+        for peer in peers {
+            self.host.disconnect(peer, 0);
+        }
+    }
+
+    /// Ends whatever is left after the graceful close, sends the last
+    /// datagrams, and tells shutdown callers the pump has stopped.
+    async fn finish(mut self) {
+        // Peers that did not acknowledge in time get one last
+        // unacknowledged DISCONNECT (`enet_peer_disconnect_now`).
+        for (peer, entry) in self.peers.drain() {
+            entry.closed.store(true, Ordering::Release);
+            self.host.disconnect_now(peer, 0);
+        }
+        self.tokens.clear();
         self.drain();
+        self.host.flush(now_ms());
         self.flush_outgoing();
-        self.flush_events();
+        // Give a full socket buffer a short grace period instead of
+        // dropping the final datagrams.
+        let grace = TokioInstant::now() + Duration::from_millis(100);
+        while self.out_pending.is_some() && TokioInstant::now() < grace {
+            tokio::select! {
+                _ = self.socket.writable() => {}
+                _ = sleep_until(grace) => {}
+            }
+            self.flush_outgoing();
+        }
+        // Drop the host and every queue before reporting completion, so a
+        // caller of `shutdown` sees all handles closed when it resumes.
+        let waiters = std::mem::take(&mut self.shutdown_waiters);
+        drop(self);
+        for done in waiters {
+            let _ = done.send(());
+        }
     }
 
     fn handle_inbound(&mut self, n: usize, from: SocketAddr) {
@@ -1313,10 +1415,6 @@ impl Pump {
             log::debug!("lenet-tokio: dropping non-IPv4 datagram from {from}");
             return;
         };
-        // One datagram is handled per pump iteration and events are
-        // dispatched right after, so this is the source of any
-        // incoming-connection CONNECT event flushed below.
-        self.last_from = v4;
         self.host.handle_datagram(now_ms(), v4, &self.udp_buf[..n]);
     }
 
@@ -1329,6 +1427,10 @@ impl Pump {
                 data,
                 done,
             } => {
+                if self.closing.is_some() {
+                    let _ = done.send(Err(ConnectError::Closed));
+                    return;
+                }
                 let Ok(peer) = self.host.connect(addr, channel_count, data) else {
                     let _ = done.send(Err(ConnectError::Rejected));
                     return;
@@ -1400,7 +1502,10 @@ impl Pump {
                     self.host.disconnect_later(peer, data);
                 }
             }
-            Command::Shutdown => self.shutdown = true,
+            Command::Shutdown { done } => {
+                self.shutdown_waiters.push(done);
+                self.start_closing();
+            }
             Command::Listen { tx, ack } => {
                 self.accept_txs.push(tx);
                 let _ = ack.send(());
@@ -1420,11 +1525,7 @@ impl Pump {
     /// the data channel.
     fn drain(&mut self) {
         while let Ok(cmd) = self.ctrl_rx.try_recv() {
-            if let Command::Shutdown = cmd {
-                self.shutdown = true;
-            } else {
-                self.apply_command(cmd);
-            }
+            self.apply_command(cmd);
         }
         while let Ok(cmd) = self.data_rx.try_recv() {
             self.apply_command(cmd);
@@ -1516,9 +1617,17 @@ impl Pump {
                         self.host.disconnect(peer, 0);
                     }
                 } else {
-                    // Incoming connection (server role): the handshake was
-                    // completed by the datagram handled in this iteration,
-                    // so `last_from` is its remote address.
+                    // Incoming connection (server role).
+                    if self.closing.is_some() {
+                        self.host.disconnect(peer, 0);
+                        return;
+                    }
+                    let Some(remote_addr) = self.host.peer_info(peer).map(|info| info.addr) else {
+                        // Cannot happen for an id the engine just reported.
+                        log::warn!("lenet-tokio: no info for new peer {}", peer.raw());
+                        self.host.disconnect(peer, 0);
+                        return;
+                    };
                     let token = alloc_token();
                     let (event_tx, event_rx) = make_queue(&self.config.event_queue);
                     let closed = Arc::new(AtomicBool::new(false));
@@ -1536,7 +1645,7 @@ impl Pump {
                     let mut incoming = Some(Incoming {
                         token,
                         peer_id: peer,
-                        remote_addr: self.last_from,
+                        remote_addr,
                         connect_data: data,
                         shared,
                         closed,
@@ -1595,11 +1704,9 @@ impl Pump {
                     )
                 });
                 match outcome {
-                    Some((_, Ok(()))) => {}
-                    // Unknown peer (already torn down): forget it.
-                    None => {
-                        self.remove_peer(peer);
-                    }
+                    // Delivered, or the peer was already torn down (e.g.
+                    // force-closed) and its late events are dropped.
+                    Some((_, Ok(()))) | None => {}
                     // Event queue full per policy: force-close the peer
                     // instead of dropping the event or stalling.
                     Some((closed, Err(QueueError::Full))) => {

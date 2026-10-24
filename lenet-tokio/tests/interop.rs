@@ -4,13 +4,14 @@
 //! slow-consumer isolation, accept backpressure, connect timeout, shutdown,
 //! connection splitting, and remote-address visibility.
 //!
-//! Requires the `enet-helper` binary (`cargo build --workspace` produces
-//! it); override its location with the `ENET_HELPER` env var.
+//! The `enet-helper` binary is built automatically on first use; point the
+//! `ENET_HELPER` env var at a prebuilt one to skip that.
 
 use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::process::Command as AsyncCommand;
@@ -19,23 +20,45 @@ use bytes::Bytes;
 use lenet::SendFlags;
 use lenet_tokio::{ConnEvent, ConnectError, Endpoint, LenetConfig, SendError};
 
+/// The `enet-helper` oracle binary. Unless `ENET_HELPER` points at one, it
+/// is built on first use with the same cargo and target directory running
+/// these tests (`cargo test` alone only builds this crate's test harness,
+/// not other packages' binaries).
 fn helper_path() -> PathBuf {
-    if let Ok(p) = std::env::var("ENET_HELPER") {
-        return PathBuf::from(p);
-    }
-    // The oracle binary is a plain build artifact: `cargo test` only builds
-    // the test harness, so it must be produced by `cargo build --workspace`
-    // (the CI and README workflows do exactly that).
-    let mut dir = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .unwrap()
-                .join("target")
-        });
-    dir.push("debug");
-    dir.join("enet-helper")
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| {
+        if let Ok(p) = std::env::var("ENET_HELPER") {
+            return PathBuf::from(p);
+        }
+        // Ask cargo where it put the binary rather than guessing the
+        // target directory layout.
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let out = Command::new(cargo)
+            .args([
+                "build",
+                "--quiet",
+                "-p",
+                "enet-helper",
+                "--message-format=json",
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .stderr(Stdio::inherit())
+            .output()
+            .expect("spawn cargo to build enet-helper");
+        assert!(out.status.success(), "building enet-helper failed");
+        // The artifact line looks like `{..."executable":"/path",...}`;
+        // only the helper's line has a non-null executable.
+        let stdout = String::from_utf8(out.stdout).expect("cargo output is UTF-8");
+        let path = stdout
+            .lines()
+            .find_map(|line| {
+                let rest = line.split_once("\"executable\":\"")?.1;
+                Some(rest.split_once('"')?.0.to_string())
+            })
+            .expect("cargo reported no enet-helper executable");
+        PathBuf::from(path)
+    })
+    .clone()
 }
 
 /// An `ENet` echo server (the helper's `server` mode), killed on drop.
@@ -54,7 +77,7 @@ impl Helper {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn enet-helper — build it first with `cargo build --workspace`");
+            .expect("spawn enet-helper");
         let mut ready = String::new();
         if wait_ready(&mut child, &mut ready, 3000) {
             Helper { child, port }
@@ -481,21 +504,37 @@ async fn connect_timeout_resolves_timed_out() {
     );
 }
 
-/// `Endpoint::shutdown` flushes and stops the driver; handles then fail
+/// `Endpoint::shutdown` disconnects peers gracefully, flushes, and stops the
+/// driver before returning; handles then fail
 /// closed and queues close.
 #[tokio::test]
 async fn shutdown_closes_everything() {
-    let helper = Helper::start();
+    let mut helper = Helper::start();
     let endpoint = Endpoint::start(LenetConfig::new()).await.expect("endpoint");
     let mut accepts = endpoint.listen().await.expect("listen");
     let mut conn = handshake(&endpoint, helper.addr()).await;
 
+    let started = std::time::Instant::now();
     endpoint.shutdown().await.expect("shutdown");
+    // The peer acknowledged the disconnect, so shutdown did not need to
+    // wait out the timeout.
+    assert!(started.elapsed() < Duration::from_secs(2));
 
+    // The graceful disconnect reached the connection, then its queue ended.
+    assert!(matches!(
+        conn.recv().await,
+        Some(ConnEvent::Disconnect { data: 0 })
+    ));
     assert!(
         conn.recv().await.is_none(),
         "queue must close after shutdown"
     );
+    // And the remote saw a real DISCONNECT (the helper server exits 0 on
+    // one) instead of timing out.
+    let status = tokio::time::timeout(Duration::from_secs(5), wait_helper_async(&mut helper))
+        .await
+        .expect("helper must see the disconnect");
+    assert!(status.success());
     assert!(
         matches!(
             conn.send(0, SendFlags::RELIABLE, b"x".to_vec()).await,

@@ -3,7 +3,7 @@
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use lenet::{Event, HostBuilder, SendFlags};
+use lenet::{Event, HostBuilder, PeerState, SendFlags};
 
 fn addr(port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
@@ -41,7 +41,7 @@ fn settle(a: &mut lenet::Host, b: &mut lenet::Host) {
 }
 
 /// Returns (host_a, host_b, peer id at `a`, peer id at `b`, connect data as
-/// seen by `a`'s CONNECT event).
+/// seen by `b`'s (the accepting side's) CONNECT event).
 #[allow(clippy::type_complexity)]
 fn connect_pair() -> (lenet::Host, lenet::Host, lenet::PeerId, lenet::PeerId, u32) {
     let mut a = HostBuilder::new()
@@ -63,12 +63,14 @@ fn connect_pair() -> (lenet::Host, lenet::Host, lenet::PeerId, lenet::PeerId, u3
     while let Some(ev) = a.poll_event() {
         if let Event::Connect { peer, data } = ev {
             pa_ev = Some(peer);
-            connect_data = Some(data);
+            // The connecting side's event carries no payload (ENet parity).
+            assert_eq!(data, 0);
         }
     }
     while let Some(ev) = b.poll_event() {
-        if let Event::Connect { peer, .. } = ev {
+        if let Event::Connect { peer, data } = ev {
             pb_ev = Some(peer);
+            connect_data = Some(data);
         }
     }
     assert_eq!(pa_ev, Some(pa));
@@ -86,7 +88,7 @@ fn handshake_and_connect_data() {
     let (mut a, mut b, pa, pb, connect_data) = connect_pair();
     assert_eq!(pa.raw(), 0);
     assert_eq!(pb.raw(), 0);
-    // The connect payload (0x77) surfaces on both sides' CONNECT events.
+    // The connect payload (0x77) surfaces on the accepting side.
     assert_eq!(connect_data, 0x77);
     // Both hosts are idle-waiting: no more events.
     assert!(a.poll_event().is_none());
@@ -160,6 +162,50 @@ fn reassembly_beyond_64k_is_never_truncated() {
         }
     }
     panic!("100 KiB fragmented packet never delivered");
+}
+
+/// A payload larger than the receive buffer's starting size and larger
+/// than the old fixed 4 MiB buffer: the buffer must grow to fit.
+#[test]
+fn payload_beyond_4mib_grows_the_buffer() {
+    let (mut a, mut b, pa, _pb, _) = connect_pair();
+    let big: Vec<u8> = (0..5_000_000u32)
+        .map(|i| (i * 31 + (i >> 9)) as u8)
+        .collect();
+    a.send(pa, 0, SendFlags::RELIABLE, &big).expect("send");
+    for _ in 0..20_000 {
+        pump(&mut a, &mut b);
+        if let Some(Event::Receive { payload, .. }) = b.poll_event() {
+            assert_eq!(payload.len(), big.len(), "payload was truncated");
+            assert_eq!(payload, &big[..]);
+            return;
+        }
+    }
+    panic!("5 MB fragmented packet never delivered");
+}
+
+#[test]
+fn peer_info_reports_address_and_state() {
+    let (a, b, pa, pb, _) = connect_pair();
+    let info = a.peer_info(pa).expect("peer info");
+    assert_eq!(info.state, PeerState::Connected);
+    assert_eq!(info.addr, addr(1));
+    assert_eq!(
+        b.peer_info(pb).expect("peer info").state,
+        PeerState::Connected
+    );
+    // Out-of-range ids are rejected.
+    assert!(a.peer_info(lenet::PeerId::from_raw(999)).is_none());
+}
+
+/// ACKs and queued sends become datagrams on `flush`, without `service`.
+#[test]
+fn flush_emits_queued_datagrams() {
+    let (mut a, _b, pa, _pb, _) = connect_pair();
+    a.send(pa, 0, SendFlags::RELIABLE, b"x").expect("send");
+    assert!(a.poll_outgoing().is_none(), "nothing before flush");
+    a.flush(1000);
+    assert!(a.poll_outgoing().is_some(), "flush packs the send");
 }
 
 #[test]

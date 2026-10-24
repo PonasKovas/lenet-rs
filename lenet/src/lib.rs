@@ -9,6 +9,11 @@
 //! serialize access yourself) — see `lenet-tokio` for a ready-made driver
 //! that does exactly that.
 //!
+//! Process-wide effects: building the first host starts the Lean runtime,
+//! which sets `SIGPIPE` to ignored for the whole process (writes to a
+//! closed pipe then fail with `EPIPE` instead of killing it) and starts two
+//! background threads. Neither is undone.
+//!
 //! # Borrowing
 //!
 //! [`Host::poll_event`] and [`Host::poll_outgoing`] return views that borrow
@@ -29,7 +34,7 @@
 //!     .expect("host");
 //! let addr: SocketAddrV4 = "127.0.0.1:40011".parse().unwrap();
 //! let peer = host.connect(addr, 2, 0x1234).expect("connect");
-//! host.service(0);
+//! host.flush(0);
 //! host.send(peer, 0, SendFlags::RELIABLE, b"hello").expect("send");
 //! while let Some(out) = host.poll_outgoing() { /* transmit out.data via UDP */ }
 //! while let Some(event) = host.poll_event() { /* handle */ }
@@ -37,20 +42,19 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use bitflags::bitflags;
 
 pub use lenet_sys as ffi;
 
-/// Maximum payload length a receive event can carry: the engine rejects
-/// reassemblies above `maximumMtu * 1024` (`Lenet.Constants.maximumMtu`,
-/// a fixed 4096 — independent of the host's configured MTU; see
-/// `FragmentAssembler.init`), so a buffer of exactly this size makes the
-/// `payload_len <= cap` assertion in `poll_event` structurally
-/// unreachable from network input. It can only fire on a C-layer bug.
-const MAX_RECV_PAYLOAD: usize = 4096 * 1024;
+/// Starting size of a host's receive buffer. It grows on demand (up to
+/// [`MAX_PACKET_SIZE`]) when a larger payload arrives.
+const INITIAL_RECV_BUF: usize = 64 * 1024;
+
+/// The largest packet [`Host::send`] takes, and the largest payload a
+/// [`Event::Receive`] can carry (ENet's default maximum packet size).
+pub const MAX_PACKET_SIZE: usize = ffi::LENET_MAX_PACKET_SIZE;
 
 /// Identifies a peer within a host. Opaque newtype; ids are recycled by the
 /// protocol engine after a peer disconnects — upper layers (e.g.
@@ -85,6 +89,9 @@ bitflags! {
 /// host's internal buffer; the borrow ends at the next [`Host`] method call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
+    /// A connection completed. `data` is the connect payload the remote
+    /// sent on the accepting (server) side, and 0 on the side that called
+    /// [`Host::connect`] (`ENet` parity).
     Connect {
         peer: PeerId,
         data: u32,
@@ -107,6 +114,50 @@ pub enum Event<'a> {
 pub struct Outgoing<'a> {
     pub addr: SocketAddrV4,
     pub data: &'a [u8],
+}
+
+/// A peer's connection state, as ENet's `ENetPeerState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PeerState {
+    Disconnected,
+    Connecting,
+    AcknowledgingConnect,
+    Connected,
+    DisconnectLater,
+    Disconnecting,
+    AcknowledgingDisconnect,
+    Zombie,
+}
+
+impl PeerState {
+    fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            ffi::LENET_PEER_STATE_DISCONNECTED => Self::Disconnected,
+            ffi::LENET_PEER_STATE_CONNECTING => Self::Connecting,
+            ffi::LENET_PEER_STATE_ACKNOWLEDGING_CONNECT => Self::AcknowledgingConnect,
+            ffi::LENET_PEER_STATE_CONNECTED => Self::Connected,
+            ffi::LENET_PEER_STATE_DISCONNECT_LATER => Self::DisconnectLater,
+            ffi::LENET_PEER_STATE_DISCONNECTING => Self::Disconnecting,
+            ffi::LENET_PEER_STATE_ACKNOWLEDGING_DISCONNECT => Self::AcknowledgingDisconnect,
+            ffi::LENET_PEER_STATE_ZOMBIE => Self::Zombie,
+            _ => return None,
+        })
+    }
+}
+
+/// A snapshot of one peer, from [`Host::peer_info`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeerInfo {
+    pub state: PeerState,
+    /// The peer's remote address.
+    pub addr: SocketAddrV4,
+    /// Mean round-trip time in ms.
+    pub round_trip_time: u32,
+    /// Round-trip time variance in ms.
+    pub round_trip_time_variance: u32,
+    /// Packet throttle, out of 32 (`ENET_PEER_PACKET_THROTTLE_SCALE`).
+    pub packet_throttle: u32,
 }
 
 #[derive(Debug)]
@@ -261,7 +312,7 @@ impl HostBuilder {
         }
         let host = Host {
             raw,
-            payload_buf: vec![MaybeUninit::uninit(); MAX_RECV_PAYLOAD].into_boxed_slice(),
+            payload_buf: vec![0; INITIAL_RECV_BUF],
         };
         if self.checksum {
             // SAFETY: `host.raw` is a valid host pointer as of the line above.
@@ -278,12 +329,10 @@ impl HostBuilder {
 /// serialization).
 pub struct Host {
     raw: *mut ffi::lenet_host,
-    /// Reusable receive buffer, pre-sized to the engine's hard maximum
-    /// payload so `poll_event` can never truncate. Stored as
-    /// `MaybeUninit`: the C layer writes into the raw allocation, and only
-    /// the prefix it reports (`payload_len`) is ever read back as
-    /// initialized.
-    payload_buf: Box<[MaybeUninit<u8>]>,
+    /// Reusable receive buffer. Starts small and grows when the C layer
+    /// reports a payload that does not fit, so `poll_event` never
+    /// truncates.
+    payload_buf: Vec<u8>,
 }
 
 // The C contract: one host, one thread. A Host may move between threads
@@ -396,6 +445,77 @@ impl Host {
         unsafe { ffi::lenet_host_disconnect_later(self.raw, peer.raw(), data) };
     }
 
+    /// `ENet`'s `enet_peer_disconnect_now`: ends the connection at once,
+    /// without a [`Event::Disconnect`]. A connection still up sends one
+    /// unacknowledged DISCONNECT on the next service or flush; the slot is
+    /// free after it.
+    pub fn disconnect_now(&mut self, peer: PeerId, data: u32) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_peer_disconnect_now(self.raw, peer.raw(), data) };
+    }
+
+    /// `ENet`'s `enet_peer_reset`: frees the slot at once; nothing is sent
+    /// and no event is reported.
+    pub fn reset_peer(&mut self, peer: PeerId) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_peer_reset(self.raw, peer.raw()) };
+    }
+
+    /// `ENet`'s `enet_peer_ping`: queues a PING to a connected peer.
+    pub fn ping(&mut self, peer: PeerId) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_peer_ping(self.raw, peer.raw()) };
+    }
+
+    /// `ENet`'s `enet_peer_ping_interval`: how long a peer may be idle
+    /// before the keepalive PING, in ms; 0 means the default (500).
+    pub fn set_ping_interval(&mut self, peer: PeerId, interval_ms: u32) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_peer_ping_interval(self.raw, peer.raw(), interval_ms) };
+    }
+
+    /// `ENet`'s `enet_host_bandwidth_limit`: bytes/second, 0 = unlimited.
+    /// Peers learn their new limits at the next throttle epoch.
+    pub fn set_bandwidth_limit(&mut self, incoming: u32, outgoing: u32) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_host_bandwidth_limit(self.raw, incoming, outgoing) };
+    }
+
+    /// `ENet`'s `enet_host_channel_limit`: the most channels an incoming
+    /// connection gets; 0 means 255.
+    pub fn set_channel_limit(&mut self, channel_limit: usize) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_host_channel_limit(self.raw, channel_limit) };
+    }
+
+    /// A snapshot of `peer`: state, remote address, RTT and throttle.
+    /// `None` for a peer id outside the host's slots.
+    #[must_use]
+    pub fn peer_info(&self, peer: PeerId) -> Option<PeerInfo> {
+        let mut raw = ffi::lenet_peer_info {
+            state: 0,
+            ip: 0,
+            port: 0,
+            round_trip_time: 0,
+            round_trip_time_variance: 0,
+            packet_throttle: 0,
+        };
+        let r = unsafe {
+            // SAFETY: `self.raw` is valid; `raw` is a valid out-struct.
+            ffi::lenet_peer_get_info(self.raw, peer.raw(), &mut raw)
+        };
+        if r != 0 {
+            return None;
+        }
+        Some(PeerInfo {
+            state: PeerState::from_raw(raw.state)?,
+            addr: SocketAddrV4::new(Ipv4Addr::from(u32::from_be(raw.ip)), raw.port),
+            round_trip_time: raw.round_trip_time,
+            round_trip_time_variance: raw.round_trip_time_variance,
+            packet_throttle: raw.packet_throttle,
+        })
+    }
+
     /// `ENet`'s `enet_peer_throttle_configure`: sets the local throttle
     /// parameters and informs the remote peer.
     pub fn throttle_configure(
@@ -437,6 +557,16 @@ impl Host {
                 data.len(),
             )
         };
+    }
+
+    /// `ENet`'s `enet_host_flush`: packs everything queued (ACKs for fed
+    /// datagrams, sent packets, disconnects) into outgoing datagrams
+    /// without running the timers. Datagrams only appear after `flush` or
+    /// [`Host::service`], so call one after feeding datagrams or queueing
+    /// sends, then drain [`Host::poll_outgoing`].
+    pub fn flush(&mut self, now_ms: u32) {
+        // SAFETY: `self.raw` is valid.
+        unsafe { ffi::lenet_host_flush(self.raw, now_ms) };
     }
 
     /// Runs the connection's timers: retransmissions, timeouts, keepalive
@@ -494,19 +624,15 @@ impl Host {
 
     /// Pops one application event. The payload of [`Event::Receive`] borrows
     /// the host's internal buffer and is valid until the next `&mut self`
-    /// call on this host. Never truncates: the internal buffer is sized to
-    /// the engine's maximum payload.
+    /// call on this host. Never truncates: the internal buffer grows to fit
+    /// any payload (up to [`MAX_PACKET_SIZE`]).
     ///
     /// # Panics
     ///
-    /// If the C layer violates its contract (reports an event type outside
-    /// `{0, 1}`, or a payload longer than the buffer capacity, which would
-    /// otherwise read out of bounds). Both are engine bugs, not runtime
-    /// conditions: the buffer is sized to the engine's hard reassembly
-    /// maximum (`Constants.maximumMtu * 1024`), so no packet from a remote
-    /// peer can exceed it — a violation means memory safety is already
-    /// compromised, and panicking beats truncating data or reading out of
-    /// bounds.
+    /// If the C layer violates its contract (an error return, an unknown
+    /// event type, or a payload length larger than the buffer it was
+    /// given). These are engine bugs, not runtime conditions: panicking
+    /// beats truncating data or reading out of bounds.
     pub fn poll_event(&mut self) -> Option<Event<'_>> {
         let mut raw: ffi::lenet_event = ffi::lenet_event {
             type_: 0,
@@ -515,30 +641,33 @@ impl Host {
             data: 0,
         };
         let mut payload_len: usize = 0;
-        let cap = self.payload_buf.len();
-        let r = unsafe {
-            // SAFETY: `self.raw` is valid; `payload_buf` is a valid writable
-            // buffer of `cap` bytes for the call's duration.
-            ffi::lenet_host_poll_event(
-                self.raw,
-                &mut raw,
-                self.payload_buf.as_mut_ptr().cast(),
-                cap,
-                &mut payload_len,
-            )
-        };
-        // The C layer reports the event's true payload length even when it
-        // had to truncate the copy (`copy = min(len, cap)`), so
-        // `payload_len <= cap` is the load-bearing memory-safety check for
-        // the slice below. A plain assert (not `debug_assert!`): it must
-        // hold in release builds too.
-        assert!(
-            payload_len <= cap,
-            "lenet FFI wrote payload exceeding capacity"
-        );
-        if r != 1 {
-            assert!(r == 0, "lenet_host_poll_event failed: {r}");
-            return None;
+        loop {
+            let cap = self.payload_buf.len();
+            let r = unsafe {
+                // SAFETY: `self.raw` is valid; `payload_buf` is a valid
+                // writable buffer of `cap` bytes for the call's duration.
+                ffi::lenet_host_poll_event(
+                    self.raw,
+                    &mut raw,
+                    self.payload_buf.as_mut_ptr().cast(),
+                    cap,
+                    &mut payload_len,
+                )
+            };
+            match r {
+                1 => break,
+                0 => return None,
+                // The payload does not fit: nothing was popped and
+                // `payload_len` is the size needed. Grow and retry.
+                -2 => {
+                    assert!(
+                        payload_len > cap,
+                        "lenet_host_poll_event asked for {payload_len} bytes but had {cap}"
+                    );
+                    self.payload_buf.resize(payload_len, 0);
+                }
+                _ => panic!("lenet_host_poll_event failed: {r}"),
+            }
         }
         let peer = PeerId(raw.peer_id);
         let event = match raw.type_ {
@@ -550,16 +679,19 @@ impl Host {
                 peer,
                 data: raw.data,
             },
-            ffi::LENET_EVENT_RECEIVE => Event::Receive {
-                peer,
-                channel_id: raw.channel_id,
-                // SAFETY: the C layer wrote `payload_len` (asserted above to
-                // fit the buffer) initialized bytes into `payload_buf`
-                // during the call above; only that prefix is read as `[u8]`.
-                payload: unsafe {
-                    std::slice::from_raw_parts(self.payload_buf.as_ptr().cast(), payload_len)
-                },
-            },
+            ffi::LENET_EVENT_RECEIVE => {
+                // A plain assert (not `debug_assert!`): the slice below
+                // relies on it in release builds too.
+                assert!(
+                    payload_len <= self.payload_buf.len(),
+                    "lenet FFI reported a payload exceeding its buffer"
+                );
+                Event::Receive {
+                    peer,
+                    channel_id: raw.channel_id,
+                    payload: &self.payload_buf[..payload_len],
+                }
+            }
             _ => panic!(
                 "lenet_host_poll_event reported unknown event type {}",
                 raw.type_

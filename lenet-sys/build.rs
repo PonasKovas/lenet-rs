@@ -1,10 +1,14 @@
-//! Build script: makes `lenet-sys` a normal, self-sufficient sys crate.
+//! Build script: builds `liblenet.a` from a pinned Lenet revision.
 //!
-//! By default it fetches the Lenet sources (a separate repository) into
-//! this crate's build directory — tracking the newest upstream commit —
-//! provisions the Lean toolchain via elan if needed, and builds
-//! `liblenet.a` with the Lenet repo's own Makefile. All you need is git,
-//! curl, cc/make, and a network.
+//! By default it clones the Lenet sources (a separate repository) at
+//! `LENET_REV` into this crate's build directory and builds `liblenet.a`
+//! with the Lenet repo's own Makefile. The build is reproducible: the same
+//! lenet-rs commit always builds the same Lenet code.
+//!
+//! Requirements: git, cc/make, a network for the first clone, and the Lean
+//! toolchain manager (elan, https://github.com/leanprover/elan). Nothing is
+//! installed for you: elan itself fetches the Lean version Lenet pins in
+//! its `lean-toolchain` file the first time it is used.
 //!
 //! Local development against a Lenet checkout: set `LENET_DIR` to the repo
 //! root (no fetching). The build is incremental — editing Lenet sources
@@ -15,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LENET_REPO: &str = "https://github.com/PonasKovas/lenet";
-
-const ELAN_INIT: &str = "https://elan.lean-lang.org/elan-init.sh";
+/// The Lenet commit this crate's FFI declarations match (`lenet.h`).
+/// Bump it together with `src/lib.rs`.
+const LENET_REV: &str = "128c9038ce351d4b3742038bf9eb855750e6fece";
 
 fn fail(msg: &str) -> ! {
     eprintln!("\nlenet-sys build script: {msg}");
@@ -34,127 +39,111 @@ fn run(desc: &str, mut cmd: Command) {
     }
 }
 
-/// `git` invocation with output inherited (visible in cargo's build log).
-/// `repo_arg`, when given, is passed to `-C`.
-fn git(args: &[&str], repo_arg: &Path) {
+/// `git -C <repo> <args>`, failing the build on error.
+fn git(args: &[&str], repo: &Path) {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(repo_arg).args(args);
+    cmd.arg("-C").arg(repo).args(args);
     run(&format!("git {} <lenet>", args.join(" ")), cmd);
 }
 
-/// Best-effort `git` invocation: true on success, false (with a warning)
-/// on failure. Used where an offline environment should degrade gracefully.
-fn git_tolerant(args: &[&str], repo_arg: &Path) -> bool {
-    let status = Command::new("git")
+/// `git -C <repo> <args>`: true on success. For probes that may fail.
+fn git_ok(args: &[&str], repo: &Path) -> bool {
+    Command::new("git")
         .arg("-C")
-        .arg(repo_arg)
+        .arg(repo)
         .args(args)
-        .status();
-    let ok = matches!(status, Ok(s) if s.success());
-    if !ok {
-        println!(
-            "cargo:warning=lenet-sys: `git {} <lenet>` failed (offline?); continuing with the existing Lenet checkout",
-            args.join(" ")
-        );
-    }
-    ok
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
-/// Directories whose existence makes the Lean toolchain available without
-/// installing anything: an elan install at `$HOME/.elan`, plus whatever is
-/// already on PATH.
-fn lean_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        dirs.push(PathBuf::from(home).join(".elan").join("bin"));
-    }
-    dirs
+fn clone(dir: &Path) {
+    println!(
+        "cargo:warning=lenet-sys: cloning Lenet (pinned {})",
+        &LENET_REV[..8]
+    );
+    let mut cmd = Command::new("git");
+    cmd.args(["clone", "--quiet", LENET_REPO]).arg(dir);
+    run(&format!("git clone {LENET_REPO}"), cmd);
 }
 
-/// True if `name` is an existing file in one of the search dirs / PATH.
+/// The elan bin directory, where a standard elan install puts `lake`.
+fn elan_bin() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".elan").join("bin"))
+}
+
+/// True if `name` is an existing file in the elan bin dir or on PATH.
 fn have_tool(name: &str) -> bool {
-    let mut dirs = lean_search_dirs();
-    if let Some(path) = env::var_os("PATH") {
-        dirs.extend(env::split_paths(&path));
-    }
-    dirs.iter().any(|d| d.join(name).is_file())
+    let path = env::var_os("PATH").unwrap_or_default();
+    elan_bin()
+        .into_iter()
+        .chain(env::split_paths(&path))
+        .any(|d| d.join(name).is_file())
 }
 
-/// PATH with the elan dir prepended, for spawned build commands.
+/// PATH with the elan bin dir prepended, for spawned build commands.
 fn path_with_elan() -> std::ffi::OsString {
-    let mut path = env::split_paths(&env::var_os("PATH").unwrap_or_default()).collect::<Vec<_>>();
-    for dir in lean_search_dirs().into_iter().rev() {
-        path.insert(0, dir);
-    }
-    env::join_paths(&path).expect("PATH join")
+    let path = env::var_os("PATH").unwrap_or_default();
+    let dirs = elan_bin().into_iter().chain(env::split_paths(&path));
+    env::join_paths(dirs).expect("PATH join")
 }
 
-/// Where the Lenet sources live: `LENET_DIR` (developer checkout) or an
-/// auto-updated clone inside this build's OUT_DIR tracking the newest
-/// upstream commit on the remote's default branch.
+/// Where the Lenet sources live: `LENET_DIR` (developer checkout) or a
+/// clone at `LENET_REV` inside this build's OUT_DIR.
 fn resolve_sources(out_dir: &Path) -> PathBuf {
+    println!("cargo:rerun-if-env-changed=LENET_DIR");
     if let Some(dir) = env::var_os("LENET_DIR") {
-        println!("cargo:rerun-if-env-changed=LENET_DIR");
         return PathBuf::from(dir);
     }
 
     let dir = out_dir.join("lenet");
     if !dir.join(".git").exists() {
-        println!("cargo:warning=lenet-sys: cloning Lenet (newest upstream commit)");
-        let status = Command::new("git")
-            .args(["clone", "--quiet", LENET_REPO])
-            .arg(&dir)
-            .status()
-            .unwrap_or_else(|e| fail(&format!("failed to spawn git: {e} (is git installed?)")));
-        if !status.success() {
-            fail(&format!("git clone of {LENET_REPO} failed"));
-        }
+        clone(&dir);
     }
-    // Update to the newest upstream commit. The fetch degrades gracefully
-    // when offline: build from the existing checkout instead.
-    let updated = git_tolerant(&["fetch", "origin"], &dir);
-    if updated {
-        git(&["reset", "--hard", "--quiet", "origin/HEAD"], &dir);
+    // Fetch only when the pinned commit is missing (e.g. after a bump), so
+    // builds after the first one work offline.
+    let have_rev = git_ok(
+        &["cat-file", "-e", &format!("{LENET_REV}^{{commit}}")],
+        &dir,
+    );
+    if !have_rev {
+        git(&["fetch", "--quiet", "origin"], &dir);
     }
+    // Also repairs local damage (an interrupted checkout, edited files).
+    git(&["reset", "--hard", "--quiet", LENET_REV], &dir);
 
-    // Sentinel check: a damaged checkout (e.g. zero-length files after a
-    // crash) is wiped and re-cloned rather than trusted.
+    // Sentinel check: a damaged clone (e.g. zero-length files after a
+    // crash) is wiped and cloned again rather than trusted.
     let healthy = |d: &Path| {
-        std::fs::metadata(d.join("lean-toolchain"))
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-            && std::fs::metadata(d.join("csrc").join("lenet_capi.c"))
-                .map(|m| m.len() > 0)
-                .unwrap_or(false)
+        [
+            "lean-toolchain",
+            "csrc/lenet_capi.c",
+            "csrc/include/lenet.h",
+        ]
+        .iter()
+        .all(|f| std::fs::metadata(d.join(f)).is_ok_and(|m| m.len() > 0))
     };
     if !healthy(&dir) {
-        println!("cargo:warning=lenet-sys: Lenet checkout damaged; re-fetching");
+        println!("cargo:warning=lenet-sys: Lenet clone damaged; cloning again");
         std::fs::remove_dir_all(&dir)
             .unwrap_or_else(|e| fail(&format!("cannot remove damaged clone: {e}")));
-        let status = Command::new("git")
-            .args(["clone", "--quiet", LENET_REPO])
-            .arg(&dir)
-            .status()
-            .unwrap_or_else(|e| fail(&format!("failed to spawn git: {e}")));
-        if !status.success() {
-            fail(&format!("git clone of {LENET_REPO} failed"));
-        }
+        clone(&dir);
+        git(&["reset", "--hard", "--quiet", LENET_REV], &dir);
         if !healthy(&dir) {
-            fail("re-cloned Lenet checkout still looks damaged");
+            fail("the fresh Lenet clone still looks damaged");
         }
     }
     dir
 }
 
 /// Emit rerun-if-changed for every Lenet source file (skipping build
-/// outputs), so editing Lenet rebuilds exactly as needed.
+/// outputs), so editing a `LENET_DIR` checkout rebuilds exactly as needed.
 fn track_sources(root: &Path) {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         println!("cargo:rerun-if-changed={}", dir.display());
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -175,104 +164,34 @@ fn track_sources(root: &Path) {
     }
 }
 
-/// elan init (idempotent); skips when the toolchain is already available.
-fn ensure_elan() {
-    if have_tool("lake") {
-        return;
-    }
-    println!("cargo:warning=lenet-sys: installing the Lean toolchain manager (elan)");
-    run("elan install", {
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(format!(
-            "curl -sSfL {ELAN_INIT} | sh -s -- -y --default-toolchain none"
-        ));
-        cmd
-    });
-    if !have_tool("lake") {
-        fail(
-            "elan was installed but `lake` is still not available. \
-             Install Lean manually (https://lean-lang.org/lean4/download/) \
-             or set LENET_DIR to a Lenet checkout with a prebuilt \
-             csrc/build/liblenet.a.",
-        );
-    }
-}
-
-/// True if elan already has the pinned toolchain installed. Matches on the
-/// version part (`v4.33.1`), which appears in the listing regardless of
-/// whether elan shows the full `leanprover/lean4:v4.33.1` name or a bare
-/// version (styles differ across elan versions).
-fn toolchain_installed(pinned: &str) -> bool {
-    let version = pinned.rsplit(':').next().unwrap_or(pinned);
-    Command::new("elan")
-        .args(["toolchain", "list"])
-        .env("PATH", path_with_elan())
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(version))
-        .unwrap_or(false)
-}
-
-/// Installs the exact toolchain Lenet pins. Idempotent: newer elan
-/// releases exit non-zero with "already installed", so the list is checked
-/// first and the install skipped when present. A no-op when elan is not
-/// available at all (a self-managed `lake` on PATH is used as-is).
-fn ensure_toolchain(src: &Path, verbose: bool) {
-    let pinned = std::fs::read_to_string(src.join("lean-toolchain"))
-        .unwrap_or_else(|e| fail(&format!("cannot read lean-toolchain: {e}")))
-        .trim()
-        .to_string();
-    if !have_tool("elan") || toolchain_installed(&pinned) {
-        return;
-    }
-    if verbose {
-        println!("cargo:warning=lenet-sys: ensuring Lean toolchain {pinned} (no-op if cached)");
-    }
-    let mut cmd = Command::new("elan");
-    cmd.args(["toolchain", "install", &pinned]);
-    cmd.env("PATH", path_with_elan());
-    run(&format!("elan toolchain install {pinned}"), cmd);
-}
-
-/// Prefix of the toolchain `lean-toolchain` names, as resolved by elan from
-/// the Lenet repo root (`lean --print-prefix`).
-fn toolchain_prefix(src: &Path) -> PathBuf {
-    let out = Command::new("lean")
-        .arg("--print-prefix")
-        .current_dir(src)
-        .env("PATH", path_with_elan())
-        .output()
-        .unwrap_or_else(|e| fail(&format!("failed to spawn `lean --print-prefix`: {e}")));
-    if !out.status.success() {
-        fail(&format!("`lean --print-prefix` failed with {}", out.status));
-    }
-    let prefix = String::from_utf8(out.stdout)
-        .unwrap_or_else(|_| fail("`lean --print-prefix` printed non-UTF-8 output"));
-    PathBuf::from(prefix.trim())
-}
-
 /// Builds `csrc/build/liblenet.a` with the Lenet repo's own Makefile
 /// (incremental: a no-op when everything is current).
 fn ensure_built(src: &Path) {
     let lib = src.join("csrc").join("build").join("liblenet.a");
-    let have_lean = have_tool("lake");
 
-    if lib.exists() && !have_lean {
-        // Offline developer with a prebuilt checkout: link it as-is.
-        return;
+    if !have_tool("lake") {
+        if lib.exists() {
+            // A prebuilt checkout without a Lean install: link it as-is.
+            return;
+        }
+        fail(
+            "the Lean toolchain is needed to build Lenet, but `lake` was not \
+             found on PATH or in ~/.elan/bin. Install elan \
+             (https://github.com/leanprover/elan#installation); it fetches \
+             the Lean version Lenet pins on first use. Alternatively, set \
+             LENET_DIR to a Lenet checkout with a prebuilt \
+             csrc/build/liblenet.a.",
+        );
     }
 
-    ensure_elan();
-    ensure_toolchain(src, !have_lean);
-
     if !lib.exists() {
-        println!("cargo:warning=lenet-sys: building Lenet (Lean compile; first build takes a few minutes)");
+        println!(
+            "cargo:warning=lenet-sys: building Lenet (Lean compile; first build takes a few minutes)"
+        );
     }
 
     let mut cmd = Command::new("make");
     cmd.arg("-C").arg(src.join("csrc"));
-    // Older Lenet Makefiles pick the first toolchain under ~/.elan, not the
-    // pinned one; override it so the shim and runtime match what lake uses.
-    cmd.arg(format!("TOOLCHAIN={}", toolchain_prefix(src).display()));
     cmd.env("PATH", path_with_elan());
     run("make -C <lenet>/csrc", cmd);
 
@@ -282,11 +201,12 @@ fn ensure_built(src: &Path) {
 }
 
 fn main() {
-    if cfg!(windows) {
+    // The target, not the machine running this script.
+    if env::var("CARGO_CFG_TARGET_FAMILY").as_deref() != Ok("unix") {
         fail(
-            "Windows is not supported: the Lean static runtime is built \
-             without -fPIC TLS (shared libraries are impossible and the \
-             build tooling assumes a POSIX shell). Use Linux or macOS.",
+            "only Unix targets are supported: the Lean static runtime is \
+             built without -fPIC TLS (shared libraries are impossible) and \
+             the build tooling assumes a POSIX shell. Use Linux or macOS.",
         );
     }
 
@@ -300,7 +220,12 @@ fn main() {
         ));
     }
 
-    track_sources(&src);
+    if env::var_os("LENET_DIR").is_some() {
+        track_sources(&src);
+    } else {
+        // The pinned clone only changes when LENET_REV (in this file) does.
+        println!("cargo:rerun-if-changed=build.rs");
+    }
     ensure_built(&src);
 
     let build_dir = src.join("csrc").join("build");
@@ -310,16 +235,4 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=m");
-
-    // Make this build script run on every cargo build so the auto-clone
-    // can be refreshed to the newest upstream commit (a cheap no-op when
-    // already current: one `git fetch` + incremental make). Without this,
-    // cargo would only rerun the script when tracked sources change — and
-    // never discover new upstream commits. `LENET_DIR` builds skip the
-    // fetch, but rerunning is harmless there (incremental make).
-    if !env::var_os("LENET_DIR").is_some() {
-        let sentinel = out_dir.join("lenet-always-rerun");
-        println!("cargo:rerun-if-changed={}", sentinel.display());
-        let _ = std::fs::write(&sentinel, "");
-    }
 }
