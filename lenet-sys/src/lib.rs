@@ -7,6 +7,7 @@
 #![allow(non_camel_case_types)]
 #![allow(clippy::missing_safety_doc)]
 
+use std::marker::{PhantomData, PhantomPinned};
 use std::os::raw::{c_uchar, c_uint, c_ushort, c_void};
 
 /// Packet delivery modes (bitmask, ENet-compatible).
@@ -116,7 +117,12 @@ extern "C" {
     pub fn lenet_host_poll_outgoing(host: *mut lenet_host, out: *mut lenet_datagram) -> i32;
 }
 
+/// Opaque host type (defined in C). `PhantomData<(*mut u8, PhantomPinned)>`
+/// marks it !Send/!Sync and non-Unpin so it can never be safely moved or
+/// shared by value — only ever handled through the raw pointers the FFI
+/// returns.
 #[repr(C)]
 pub struct lenet_host {
-    _unused: [u8; 0],
+    _data: [u8; 0],
+    _marker: PhantomData<(*mut u8, PhantomPinned)>,
 }
