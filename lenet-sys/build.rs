@@ -208,6 +208,23 @@ fn ensure_toolchain(src: &Path, verbose: bool) {
     run(&format!("elan toolchain install {pinned}"), cmd);
 }
 
+/// Prefix of the toolchain `lean-toolchain` names, as resolved by elan from
+/// the Lenet repo root (`lean --print-prefix`).
+fn toolchain_prefix(src: &Path) -> PathBuf {
+    let out = Command::new("lean")
+        .arg("--print-prefix")
+        .current_dir(src)
+        .env("PATH", path_with_elan())
+        .output()
+        .unwrap_or_else(|e| fail(&format!("failed to spawn `lean --print-prefix`: {e}")));
+    if !out.status.success() {
+        fail(&format!("`lean --print-prefix` failed with {}", out.status));
+    }
+    let prefix = String::from_utf8(out.stdout)
+        .unwrap_or_else(|_| fail("`lean --print-prefix` printed non-UTF-8 output"));
+    PathBuf::from(prefix.trim())
+}
+
 /// Builds `csrc/build/liblenet.a` with the Lenet repo's own Makefile
 /// (incremental: a no-op when everything is current).
 fn ensure_built(src: &Path) {
@@ -228,6 +245,9 @@ fn ensure_built(src: &Path) {
 
     let mut cmd = Command::new("make");
     cmd.arg("-C").arg(src.join("csrc"));
+    // Older Lenet Makefiles pick the first toolchain under ~/.elan, not the
+    // pinned one; override it so the shim and runtime match what lake uses.
+    cmd.arg(format!("TOOLCHAIN={}", toolchain_prefix(src).display()));
     cmd.env("PATH", path_with_elan());
     run("make -C <lenet>/csrc", cmd);
 
