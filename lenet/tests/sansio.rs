@@ -198,6 +198,28 @@ fn peer_info_reports_address_and_state() {
     assert!(a.peer_info(lenet::PeerId::from_raw(999)).is_none());
 }
 
+#[test]
+fn outgoing_data_counts_until_acked() {
+    let (mut a, mut b, pa, _, _) = connect_pair();
+    assert_eq!(a.outgoing_data(pa), Some(0));
+    a.send(pa, 0, SendFlags::RELIABLE, &[7u8; 100])
+        .expect("send");
+    a.send(pa, 1, SendFlags::RELIABLE, &[7u8; 50])
+        .expect("send");
+    assert_eq!(a.outgoing_data(pa), Some(150), "queued, not yet sent");
+    settle(&mut a, &mut b);
+    assert_eq!(a.outgoing_data(pa), Some(0), "acknowledged");
+
+    // Sent but lost in transit: still held for retransmission.
+    a.send(pa, 0, SendFlags::RELIABLE, &[7u8; 40])
+        .expect("send");
+    a.service(1000);
+    while a.poll_outgoing().is_some() {}
+    assert_eq!(a.outgoing_data(pa), Some(40), "sent, not yet acknowledged");
+
+    assert!(a.outgoing_data(lenet::PeerId::from_raw(999)).is_none());
+}
+
 /// ACKs and queued sends become datagrams on `flush`, without `service`.
 #[test]
 fn flush_emits_queued_datagrams() {

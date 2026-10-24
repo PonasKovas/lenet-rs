@@ -127,6 +127,11 @@ extern "C" {
         peer_id: c_ushort,
         out: *mut lenet_peer_info,
     ) -> i32;
+    pub fn lenet_peer_outgoing_data(
+        host: *mut lenet_host,
+        peer_id: c_ushort,
+        out: *mut usize,
+    ) -> i32;
     pub fn lenet_peer_throttle_configure(
         host: *mut lenet_host,
         peer_id: c_ushort,

@@ -121,14 +121,21 @@ datagrams and events — is non-blocking batch work:
   backs up meanwhile — applying the same backpressure to the protocol
   engine that a slow link would. Nothing is dropped locally.
 
-**Backpressure and ordering.** `Connection::send` queues into a bounded
-command channel and genuinely awaits when it is full. Per-connection
+**Backpressure and ordering.** `Connection::send` genuinely awaits while
+`cmd_channel` async sends are already queued on the driver. The
+non-blocking `ConnectionSender::try_send` never waits and never fails for
+lack of room (like `enet_peer_send`, it always queues); cap what one peer
+can make the host hold with `LenetConfig::peer_outgoing_limit`, which
+disconnects a peer whose queued plus unacknowledged payload exceeds it.
+Per-connection
 operations keep FIFO order: a `send` followed by `disconnect` (or
 `disconnect_later`) is applied in exactly that order. `disconnect_later`
 (`enet_peer_disconnect_later` semantics) flushes queued packets before
 closing. Note `send` is fire-and-forget once queued: engine-level
 rejections (channel out of range for the negotiated count, packet too
-large) are logged by the driver and the packet dropped. Inbound behavior
+large) are logged by the driver; a rejected unreliable packet is dropped,
+and a rejected reliable one disconnects the peer, since losing it would
+leave the remote silently out of sync. Inbound behavior
 is configurable via `EventQueuePolicy`: `Unbounded` (default; mirrors C
 ENet's receive queue — events are never lost) or `BoundedThenDisconnect`
 (a full queue force-disconnects that peer with a configurable payload

@@ -24,8 +24,12 @@
 //!
 //! # Backpressure and ordering
 //!
-//! [`Connection::send`] queues into a bounded command channel and truly
-//! awaits when it is full. Per-connection operations preserve FIFO order:
+//! [`Connection::send`] awaits while [`LenetConfig::cmd_channel`] async
+//! sends are already queued on the driver. The non-blocking
+//! [`ConnectionSender::try_send`] never waits and never fails for lack of
+//! room: like C `ENet`'s `enet_peer_send` it always queues, and memory per
+//! peer is capped by [`LenetConfig::peer_outgoing_limit`] instead.
+//! Per-connection operations preserve FIFO order:
 //! a `send` followed by `disconnect` (or `disconnect_later`) is applied in
 //! exactly that order by the driver. The connection-level event queue
 //! behavior is configurable via [`EventQueuePolicy`].
@@ -120,7 +124,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
@@ -135,6 +139,7 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep_until, Instant as TokioInstant};
 
 /// Configuration for the driver, builder-style.
@@ -147,9 +152,10 @@ pub struct LenetConfig {
     /// fine-grained wakeups; this bounds how late a missed deadline can be
     /// observed. Default 100 ms.
     fallback_tick: Duration,
-    /// Capacity of the (bounded) command channel carrying `send`/`broadcast`
-    /// traffic. `Connection::send` awaits when full — this is the
-    /// driver's outbound backpressure. Default 1024.
+    /// How many async `send`/`broadcast`/`disconnect` commands may wait on
+    /// the driver at once. `Connection::send` awaits when that many are
+    /// queued — this is the driver's outbound backpressure. The
+    /// non-blocking `try_*` methods bypass it. Default 1024.
     cmd_channel: usize,
     /// Capacity of the incoming-connection queue. When full, new incoming
     /// connections are rejected immediately (graceful disconnect) instead
@@ -165,6 +171,11 @@ pub struct LenetConfig {
     /// disconnects before ending the remaining connections at once.
     /// Default 3 s.
     shutdown_timeout: Duration,
+    /// `(bytes, disconnect_data)`: a peer holding more than `bytes` of
+    /// outgoing payload ([`Host::outgoing_data`]) is disconnected with
+    /// `disconnect_data`. `None` (default) = no limit beyond the peer
+    /// timeout.
+    peer_outgoing_limit: Option<(usize, u32)>,
 }
 
 /// Queue behavior for a connection's event queue ([`Connection::recv`]).
@@ -194,6 +205,7 @@ impl Default for LenetConfig {
             event_queue: EventQueuePolicy::Unbounded,
             peer_timeout: None,
             shutdown_timeout: Duration::from_secs(3),
+            peer_outgoing_limit: None,
         }
     }
 }
@@ -256,6 +268,18 @@ impl LenetConfig {
         self.shutdown_timeout = timeout;
         self
     }
+
+    /// Disconnects (with `disconnect_data`) any peer that holds more than
+    /// `bytes` of outgoing payload: packets queued and not yet sent plus
+    /// reliable packets not yet acknowledged. Caps the memory a peer that
+    /// stops acknowledging, or acknowledges only just enough to avoid the
+    /// peer timeout, can make the host hold. Checked after the driver
+    /// applies sends to the peer.
+    #[must_use]
+    pub fn peer_outgoing_limit(mut self, bytes: usize, disconnect_data: u32) -> Self {
+        self.peer_outgoing_limit = Some((bytes, disconnect_data));
+        self
+    }
 }
 
 /// Errors from [`Endpoint::connect`] and awaiting [`Connecting`].
@@ -281,19 +305,6 @@ pub enum ConnectError {
 pub enum SendError {
     /// The connection is closed or stale (peer disconnected, slot
     /// recycled), or the endpoint's driver task is gone.
-    #[error("connection is closed or stale")]
-    Closed,
-}
-
-/// Errors from the non-blocking [`ConnectionSender::try_send`],
-/// [`ConnectionSender::try_disconnect`], and
-/// [`ConnectionSender::try_disconnect_later`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum TrySendError {
-    /// The endpoint's command channel is full; nothing was queued.
-    #[error("command channel is full")]
-    Full,
-    /// The connection is closed or stale, or the driver task is gone.
     #[error("connection is closed or stale")]
     Closed,
 }
@@ -333,11 +344,19 @@ struct Shared {
     /// Carries nothing that must stay ordered with respect to a
     /// connection's queued `send`s.
     ctrl_tx: mpsc::UnboundedSender<Command>,
-    /// Bulk data commands (`send`/`broadcast`/`disconnect`): bounded,
-    /// provides real backpressure to `Connection::send`, and preserves
-    /// per-connection FIFO order between those operations.
-    data_tx: mpsc::Sender<Command>,
+    /// Bulk data commands (`send`/`broadcast`/`disconnect`), preserving
+    /// per-connection FIFO order between those operations. Unbounded so
+    /// the non-blocking `try_*` methods never fail for lack of room; async
+    /// commands carry a permit from `send_permits`, released once the pump
+    /// applies them.
+    data_tx: mpsc::UnboundedSender<DataCommand>,
+    /// [`LenetConfig::cmd_channel`] permits: the async sends' backpressure.
+    send_permits: Arc<Semaphore>,
 }
+
+/// A data-channel command and, for async sends, the permit it holds until
+/// the pump applies it.
+type DataCommand = (Command, Option<OwnedSemaphorePermit>);
 
 impl Shared {
     fn send_ctrl(&self, cmd: Command) -> Result<(), SendError> {
@@ -345,29 +364,21 @@ impl Shared {
     }
 
     async fn send_data(&self, cmd: Command) -> Result<(), SendError> {
-        self.data_tx.send(cmd).await.map_err(|_| SendError::Closed)
+        let permit = Arc::clone(&self.send_permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| SendError::Closed)?;
+        self.data_tx
+            .send((cmd, Some(permit)))
+            .map_err(|_| SendError::Closed)
     }
 
-    fn try_send_data(&self, cmd: Command) -> Result<(), TrySendError> {
-        self.data_tx.try_send(cmd).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => TrySendError::Full,
-            mpsc::error::TrySendError::Closed(_) => TrySendError::Closed,
-        })
-    }
-
-    /// Enqueues `cmd` from a non-async context (`Drop`). Prefers the data
-    /// channel so per-connection FIFO order with queued `send`s is kept;
-    /// when it is full, falls back to the control channel — the command
-    /// may then overtake queued packets, which beats leaking a connected
-    /// peer until timeout.
-    fn send_ordered_lossy(&self, cmd: Command) {
-        match self.data_tx.try_send(cmd) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(cmd)) => {
-                let _ = self.ctrl_tx.send(cmd);
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-        }
+    /// Enqueues `cmd` on the data channel without waiting for a permit:
+    /// for the non-blocking `try_*` methods and `Drop`.
+    fn try_send_data(&self, cmd: Command) -> Result<(), SendError> {
+        self.data_tx
+            .send((cmd, None))
+            .map_err(|_| SendError::Closed)
     }
 }
 
@@ -525,10 +536,15 @@ impl Endpoint {
             .ok_or_else(|| std::io::Error::other("lenet_host_create failed"))?;
 
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let (data_tx, data_rx) = mpsc::channel(config.cmd_channel.max(1));
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        let send_permits = Arc::new(Semaphore::new(config.cmd_channel.max(1)));
         let accept_channel = config.accept_channel.max(1);
 
-        let shared = Arc::new(Shared { ctrl_tx, data_tx });
+        let shared = Arc::new(Shared {
+            ctrl_tx,
+            data_tx,
+            send_permits,
+        });
 
         tokio::spawn(
             Pump {
@@ -546,6 +562,7 @@ impl Endpoint {
                 peers: HashMap::new(),
                 tokens: HashMap::new(),
                 pending: HashMap::new(),
+                sent_to: HashSet::new(),
                 out_buf: BytesMut::new(),
                 out_pending: None,
                 recv_paused_until: None,
@@ -894,7 +911,7 @@ impl Drop for DisconnectGuard {
         // Dropping the last handle to a peer disconnects it gracefully
         // instead of leaking a zombie connection until timeout. Ordered
         // with queued `send`s when the data channel has room.
-        self.shared.send_ordered_lossy(Command::Disconnect {
+        let _ = self.shared.try_send_data(Command::Disconnect {
             token: self.token,
             data: 0,
         });
@@ -933,15 +950,18 @@ impl Connection {
         self.remote_addr
     }
 
-    /// Queues a packet for transmission. Awaits when the endpoint's command
-    /// channel is full (real backpressure).
+    /// Queues a packet for transmission. Awaits while
+    /// [`LenetConfig::cmd_channel`] async sends are already queued on the
+    /// driver (real backpressure).
     ///
     /// This is fire-and-forget once queued: `Ok(())` means the packet was
     /// handed to the driver, not that the protocol engine accepted it.
     /// Engine-level rejections (channel out of range for the negotiated
     /// channel count, packet too large, or the connection dying in the
-    /// meantime) are logged by the driver at `warn` level and the packet is
-    /// dropped.
+    /// meantime) are logged by the driver at `warn` level. A rejected
+    /// unreliable packet is dropped; a rejected reliable packet disconnects
+    /// the peer, since losing it would leave the remote silently out of
+    /// sync.
     ///
     /// # Errors
     ///
@@ -1138,23 +1158,23 @@ impl ConnectionSender {
             .await
     }
 
-    /// Non-blocking [`ConnectionSender::send`]: queues the packet if the
-    /// endpoint's command channel has room, otherwise fails with
-    /// [`TrySendError::Full`] without queuing anything.
+    /// Non-blocking [`ConnectionSender::send`]. Always queues (like C
+    /// `ENet`'s `enet_peer_send`), bypassing the [`LenetConfig::cmd_channel`]
+    /// backpressure; cap per-peer memory with
+    /// [`LenetConfig::peer_outgoing_limit`].
     ///
     /// # Errors
     ///
-    /// [`TrySendError::Full`] when the command channel is full;
-    /// [`TrySendError::Closed`] if the connection is closed or stale, or
-    /// the driver task is gone.
+    /// [`SendError::Closed`] if the connection is closed or stale, or the
+    /// driver task is gone.
     pub fn try_send(
         &self,
         channel: u8,
         flags: SendFlags,
         data: impl Into<Bytes>,
-    ) -> Result<(), TrySendError> {
+    ) -> Result<(), SendError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(TrySendError::Closed);
+            return Err(SendError::Closed);
         }
         self.shared.try_send_data(Command::Send {
             token: self.token,
@@ -1169,9 +1189,9 @@ impl ConnectionSender {
     /// # Errors
     ///
     /// See [`ConnectionSender::try_send`].
-    pub fn try_disconnect(&self, data: u32) -> Result<(), TrySendError> {
+    pub fn try_disconnect(&self, data: u32) -> Result<(), SendError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(TrySendError::Closed);
+            return Err(SendError::Closed);
         }
         self.shared.try_send_data(Command::Disconnect {
             token: self.token,
@@ -1184,9 +1204,9 @@ impl ConnectionSender {
     /// # Errors
     ///
     /// See [`ConnectionSender::try_send`].
-    pub fn try_disconnect_later(&self, data: u32) -> Result<(), TrySendError> {
+    pub fn try_disconnect_later(&self, data: u32) -> Result<(), SendError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(TrySendError::Closed);
+            return Err(SendError::Closed);
         }
         self.shared.try_send_data(Command::DisconnectLater {
             token: self.token,
@@ -1239,7 +1259,7 @@ struct Pump {
     /// close and the pump's `select!` sees `None` on both receivers.
     shared: Weak<Shared>,
     ctrl_rx: mpsc::UnboundedReceiver<Command>,
-    data_rx: mpsc::Receiver<Command>,
+    data_rx: mpsc::UnboundedReceiver<DataCommand>,
     /// Accept queues registered via [`Endpoint::listen`]. Incoming
     /// connections go to the first queue with capacity; an empty list (no
     /// listener yet) rejects every incoming connection.
@@ -1247,6 +1267,9 @@ struct Pump {
     peers: HashMap<PeerId, PeerEntry>,
     tokens: HashMap<Token, PeerId>,
     pending: HashMap<PeerId, PendingConnect>,
+    /// Peers sent to since the last [`Pump::enforce_outgoing_limit`]; only
+    /// filled when [`LenetConfig::peer_outgoing_limit`] is set.
+    sent_to: HashSet<PeerId>,
     /// Staging buffer for the next outgoing datagram (see
     /// [`Pump::flush_outgoing`]).
     out_buf: BytesMut,
@@ -1397,7 +1420,8 @@ impl Pump {
                 // Bulk data command.
                 cmd = self.data_rx.recv(), if self.data_open => {
                     match cmd {
-                        Some(cmd) => self.apply_command(cmd),
+                        // The permit (if any) is released once applied.
+                        Some((cmd, _permit)) => self.apply_command(cmd),
                         None => {
                             self.data_open = false;
                             self.start_closing();
@@ -1423,6 +1447,7 @@ impl Pump {
             }
 
             self.drain();
+            self.enforce_outgoing_limit();
             // Pack ACKs for any datagram just handled and anything the
             // commands queued; the engine only emits datagrams on flush or
             // service.
@@ -1551,8 +1576,24 @@ impl Pump {
                 data,
             } => {
                 if let Some(peer) = self.resolve(token) {
-                    if let Err(e) = self.host.send(peer, channel, flags, &data) {
-                        log::warn!("lenet-tokio: send to peer {} failed: {e}", peer.raw());
+                    match self.host.send(peer, channel, flags, &data) {
+                        Ok(()) => {
+                            if self.config.peer_outgoing_limit.is_some() {
+                                self.sent_to.insert(peer);
+                            }
+                        }
+                        // A lost reliable packet would leave the remote
+                        // silently out of sync: end the connection instead.
+                        Err(e) if flags.contains(SendFlags::RELIABLE) => {
+                            log::warn!(
+                                "lenet-tokio: reliable send to peer {} failed: {e}; disconnecting",
+                                peer.raw()
+                            );
+                            self.host.disconnect(peer, 0);
+                        }
+                        Err(e) => {
+                            log::warn!("lenet-tokio: send to peer {} failed: {e}", peer.raw());
+                        }
                     }
                 }
                 // Stale token: silently dropped by design — the handle
@@ -1565,6 +1606,9 @@ impl Pump {
                 data,
             } => {
                 self.host.broadcast(channel, flags, &data);
+                if self.config.peer_outgoing_limit.is_some() {
+                    self.sent_to.extend(self.peers.keys().copied());
+                }
             }
             Command::Disconnect { token, data } => {
                 if let Some(peer) = self.resolve(token) {
@@ -1592,6 +1636,28 @@ impl Pump {
         }
     }
 
+    /// Disconnects every peer sent to since the last call that now holds
+    /// more outgoing payload than [`LenetConfig::peer_outgoing_limit`].
+    /// Runs once per pump iteration, so a burst of sends to one peer costs
+    /// one queue walk.
+    fn enforce_outgoing_limit(&mut self) {
+        let Some((limit, disconnect_data)) = self.config.peer_outgoing_limit else {
+            return;
+        };
+        for peer in self.sent_to.drain() {
+            let Some(bytes) = self.host.outgoing_data(peer) else {
+                continue;
+            };
+            if bytes > limit {
+                log::warn!(
+                    "lenet-tokio: peer {} holds {bytes} outgoing bytes (limit {limit}); disconnecting",
+                    peer.raw()
+                );
+                self.host.disconnect(peer, disconnect_data);
+            }
+        }
+    }
+
     /// Drains every queued command without awaiting, so a burst of
     /// application traffic can never starve socket I/O or timers.
     ///
@@ -1603,7 +1669,7 @@ impl Pump {
         while let Ok(cmd) = self.ctrl_rx.try_recv() {
             self.apply_command(cmd);
         }
-        while let Ok(cmd) = self.data_rx.try_recv() {
+        while let Ok((cmd, _permit)) = self.data_rx.try_recv() {
             self.apply_command(cmd);
         }
     }

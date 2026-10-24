@@ -516,6 +516,22 @@ impl Host {
         })
     }
 
+    /// Payload bytes `peer` holds on the sending side: packets queued and
+    /// not yet sent, plus reliable packets sent and not yet acknowledged.
+    /// A peer that stops acknowledging grows this until it times out.
+    /// `None` for a peer id outside the host's slots.
+    ///
+    /// Walks the peer's queues, so it costs time linear in their length.
+    #[must_use]
+    pub fn outgoing_data(&self, peer: PeerId) -> Option<usize> {
+        let mut bytes = 0usize;
+        let r = unsafe {
+            // SAFETY: `self.raw` is valid; `bytes` is a valid out-pointer.
+            ffi::lenet_peer_outgoing_data(self.raw, peer.raw(), &mut bytes)
+        };
+        (r == 0).then_some(bytes)
+    }
+
     /// `ENet`'s `enet_peer_throttle_configure`: sets the local throttle
     /// parameters and informs the remote peer.
     pub fn throttle_configure(

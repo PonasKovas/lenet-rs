@@ -21,7 +21,7 @@ use std::process::Command;
 const LENET_REPO: &str = "https://github.com/PonasKovas/lenet";
 /// The Lenet commit this crate's FFI declarations match (`lenet.h`).
 /// Bump it together with `src/lib.rs`.
-const LENET_REV: &str = "bf9dd6f3ce23e4f3e50b89e3825fbe2c2c257acc";
+const LENET_REV: &str = "d532417e3870dc55c74490d81ea35adb435bb53e";
 
 fn fail(msg: &str) -> ! {
     eprintln!("\nlenet-sys build script: {msg}");
